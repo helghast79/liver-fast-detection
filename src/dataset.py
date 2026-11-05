@@ -29,18 +29,42 @@ def patient_split(
     rows: list[dict],
     val_ratio: float = 0.2,
     seed: int = 42,
-) -> tuple[list[dict], list[dict]]:
+    n_val_patients: int | None = None,
+) -> tuple[list[dict], list[dict], list[str]]:
+    """
+    Split rows by patient ID.
+
+    If n_val_patients is set, hold out exactly that many random patients for
+    validation; otherwise use val_ratio.
+    Returns (train_rows, val_rows, val_patient_ids).
+    """
     patients = sorted({r["patient_id"] for r in rows})
     rng = random.Random(seed)
     rng.shuffle(patients)
-    n_val = max(1, int(round(len(patients) * val_ratio))) if len(patients) > 1 else 0
-    val_patients = set(patients[:n_val])
+
+    if n_val_patients is not None:
+        n_val = min(max(0, n_val_patients), max(0, len(patients) - 1))
+    else:
+        n_val = max(1, int(round(len(patients) * val_ratio))) if len(patients) > 1 else 0
+
+    val_patient_ids = sorted(patients[:n_val])
+    val_patients = set(val_patient_ids)
     train_rows = [r for r in rows if r["patient_id"] not in val_patients]
     val_rows = [r for r in rows if r["patient_id"] in val_patients]
     if not train_rows:
-        # Tiny datasets: keep everything in train, empty val handled by caller.
-        train_rows, val_rows = rows, []
-    return train_rows, val_rows
+        train_rows, val_rows, val_patient_ids = rows, [], []
+    return train_rows, val_rows, val_patient_ids
+
+
+def filter_existing_pairs(data_root: Path, rows: list[dict]) -> list[dict]:
+    """Drop manifest rows whose image/mask files are missing on disk."""
+    kept: list[dict] = []
+    for row in rows:
+        image_path = data_root / row["image_path"]
+        mask_path = data_root / row["mask_path"]
+        if image_path.is_file() and mask_path.is_file():
+            kept.append(row)
+    return kept
 
 
 class LiverSegDataset(Dataset):

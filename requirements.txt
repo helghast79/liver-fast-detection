@@ -4,8 +4,10 @@ pydicom>=2.4.0
 highdicom>=0.22.0
 numpy>=1.24.0
 Pillow>=10.0.0
-torch>=2.1.0
-torchvision>=0.16.0
+# Install CUDA 12.6 builds on this host, e.g.:
+# pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu126
+torch==2.6.0
+torchvision==0.21.0
 tqdm>=4.66.0
 protobuf>=4.25.0,<6
 onnx>=1.15.0
