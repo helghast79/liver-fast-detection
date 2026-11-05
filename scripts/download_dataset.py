@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Download paired CT rendered images + liver SEG masks from Orthanc."""
+"""Download paired CT rendered images + liver SEG masks from Orthanc.
+
+Aligns SEG masks onto CT geometry (IOP flips, IPP in-plane offsets) and
+expands dual-acquisition series so every CT twin at the same IPP gets a mask.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +25,13 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from src.dataset_select import select_all_patients
+from src.geometry import (
+    describe_alignment,
+    geometry_from_tags,
+    group_instances_by_ipp,
+    ipp_key,
+    resample_mask_to_geometry,
+)
 from src.orthanc_client import OrthancClient
 from src.seg_masks import (
     extract_liver_frames,
@@ -33,36 +44,169 @@ from src.seg_masks import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / "data" / "raw")
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--skip-empty", action="store_true")
+    parser.add_argument("--limit-patients", type=int, default=None)
+    parser.add_argument("--patient-id", type=str, default=None)
     parser.add_argument(
-        "--output",
-        type=Path,
-        default=ROOT / "data" / "raw",
-        help="Output directory for image/mask pairs",
-    )
-    parser.add_argument(
-        "--image-size",
+        "--ipp-decimals",
         type=int,
-        default=None,
-        help="Rendered square size (default: IMAGE_SIZE from .env or 128)",
+        default=3,
+        help="IPP quantization decimals for dual-acquisition grouping",
     )
     parser.add_argument(
-        "--skip-empty",
-        action="store_true",
-        help="Skip slices whose liver mask is empty",
-    )
-    parser.add_argument(
-        "--limit-patients",
-        type=int,
-        default=None,
-        help="Optional cap on number of patients to download",
-    )
-    parser.add_argument(
-        "--patient-id",
-        type=str,
-        default=None,
-        help="Only download a single PatientID (exact match)",
+        "--match-tol-mm",
+        type=float,
+        default=1.25,
+        help="Max IPP distance (mm) when falling back to geometric CT matching",
     )
     return parser.parse_args()
+
+
+def load_ct_series_instances(client: OrthancClient, series_uid: str) -> list[dict]:
+    series_id = client.find_series_by_uid(series_uid)
+    if not series_id:
+        return []
+    series = client.get_series(series_id)
+    instances: list[dict] = []
+    for iid in series.get("Instances") or []:
+        tags = client.get_json(f"/instances/{iid}/simplified-tags")
+        geom = geometry_from_tags(tags)
+        instances.append(
+            {
+                "orthanc_id": iid,
+                "sop": str(tags["SOPInstanceUID"]),
+                "ipp": geom.ipp,
+                "iop": geom.iop,
+                "geometry": geom,
+                "tags": tags,
+            }
+        )
+    return instances
+
+
+def estimate_slice_spacing_mm(ct_instances: list[dict]) -> float:
+    if len(ct_instances) < 2:
+        return 2.5
+    normal = ct_instances[0]["geometry"].normal
+    zs = sorted(float(inst["ipp"] @ normal) for inst in ct_instances)
+    diffs = np.diff(zs)
+    diffs = diffs[np.abs(diffs) > 1e-4]
+    if len(diffs) == 0:
+        return 2.5
+    return float(np.median(np.abs(diffs)))
+
+
+def _ct_normal_positions(ct_instances: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    normal = ct_instances[0]["geometry"].normal
+    ct_z = np.array([float(inst["ipp"] @ normal) for inst in ct_instances], dtype=np.float64)
+    return normal, ct_z
+
+
+def choose_stack_z_mapping(
+    planes: list[dict],
+    by_sop: dict[str, dict],
+    ct_instances: list[dict],
+    match_tol_mm: float,
+) -> dict:
+    """
+    Choose how to map SEG plane positions onto the CT stack.
+
+    Handles:
+    - global normal offset
+    - inverted SEG stack direction (IPP step sign flipped), using SOP anchors
+      when available (seen in HCC_089).
+    """
+    if not planes or not ct_instances:
+        return {"mode": "identity", "offset_mm": 0.0, "anchor_seg_z": None}
+
+    normal, ct_z = _ct_normal_positions(ct_instances)
+    seg_z = np.array([float(p["geometry"].ipp @ normal) for p in planes], dtype=np.float64)
+
+    def hit_count(mapped_z: np.ndarray) -> int:
+        return int(sum(np.min(np.abs(ct_z - z)) <= match_tol_mm for z in mapped_z))
+
+    # Identity + global offset
+    nearest_residuals = np.array(
+        [float(z - ct_z[np.argmin(np.abs(ct_z - z))]) for z in seg_z]
+    )
+    offset = float(np.median(nearest_residuals)) if len(nearest_residuals) else 0.0
+    identity_hits = hit_count(seg_z - offset)
+
+    best = {
+        "mode": "identity",
+        "offset_mm": offset,
+        "anchor_seg_z": None,
+        "hits": identity_hits,
+    }
+
+    # Reflection about each SOP anchor: corrected_z = 2*anchor_seg_z - seg_z
+    for plane in planes:
+        sop = plane.get("sop")
+        if not sop or sop not in by_sop:
+            continue
+        anchor_seg_z = float(plane["geometry"].ipp @ normal)
+        mapped = 2.0 * anchor_seg_z - seg_z
+        # small residual after reflection
+        refl_offset = float(
+            np.median([float(z - ct_z[np.argmin(np.abs(ct_z - z))]) for z in mapped])
+        )
+        mapped = mapped - refl_offset
+        hits = hit_count(mapped)
+        if hits > best["hits"]:
+            best = {
+                "mode": "reflect",
+                "offset_mm": refl_offset,
+                "anchor_seg_z": anchor_seg_z,
+                "hits": hits,
+            }
+
+    return best
+
+
+def map_seg_z(seg_z: float, mapping: dict) -> float:
+    if mapping["mode"] == "reflect" and mapping["anchor_seg_z"] is not None:
+        return 2.0 * float(mapping["anchor_seg_z"]) - float(seg_z) - float(mapping["offset_mm"])
+    return float(seg_z) - float(mapping["offset_mm"])
+
+
+def find_ct_targets(
+    frame_sop: str | None,
+    seg_ipp: np.ndarray,
+    by_sop: dict[str, dict],
+    ct_instances: list[dict],
+    by_ipp: dict[tuple, list[dict]],
+    ipp_decimals: int,
+    match_tol_mm: float,
+    z_mapping: dict | None = None,
+) -> tuple[list[dict], str]:
+    """
+    Resolve CT instance(s) for a SEG plane.
+
+    Prefer referenced SOP (+ dual-acq IPP twins). Otherwise match by slice
+    position along the CT normal using the chosen stack mapping.
+    """
+    if frame_sop and frame_sop in by_sop:
+        ct_inst = by_sop[frame_sop]
+        twins = by_ipp.get(ipp_key(ct_inst["ipp"], ipp_decimals), [ct_inst])
+        return twins, "sop"
+
+    if not ct_instances:
+        return [], "none"
+
+    normal, ct_z = _ct_normal_positions(ct_instances)
+    raw_z = float(np.asarray(seg_ipp) @ normal)
+    seg_z = map_seg_z(raw_z, z_mapping or {"mode": "identity", "offset_mm": 0.0, "anchor_seg_z": None})
+    best_i = int(np.argmin(np.abs(ct_z - seg_z)))
+    best_dz = float(abs(ct_z[best_i] - seg_z))
+    if best_dz > match_tol_mm:
+        return [], f"geom_miss:{best_dz:.3f}"
+
+    ct_inst = ct_instances[best_i]
+    twins = by_ipp.get(ipp_key(ct_inst["ipp"], ipp_decimals), [ct_inst])
+    mode = (z_mapping or {}).get("mode", "identity")
+    return twins, f"geom_z:{mode}:{best_dz:.3f}"
 
 
 def main() -> int:
@@ -101,9 +245,7 @@ def main() -> int:
                 errors.append(f"{choice.patient_id}: SEG series has no instances")
                 continue
 
-            # Prefer a single multi-frame SEG instance; process all if needed.
-            sop_to_mask: dict[str, np.ndarray] = {}
-            seg_ds = None
+            plane_masks: dict[str, dict] = {}
             used_segments = list(choice.liver_segment_numbers)
             ref_series_uids: list[str] = []
 
@@ -119,40 +261,103 @@ def main() -> int:
                     if frames:
                         used_segments = frames[0].segment_numbers
                     for frame in frames:
-                        # If multiple frames/segments map to same SOP, OR the masks.
-                        prev = sop_to_mask.get(frame.referenced_sop_instance_uid)
+                        prev = plane_masks.get(frame.merge_key)
                         if prev is None:
-                            sop_to_mask[frame.referenced_sop_instance_uid] = frame.mask
+                            plane_masks[frame.merge_key] = {
+                                "mask": frame.mask,
+                                "geometry": frame.geometry,
+                                "sop": frame.referenced_sop_instance_uid,
+                            }
                         else:
-                            sop_to_mask[frame.referenced_sop_instance_uid] = (
-                                (prev.astype(bool) | frame.mask.astype(bool)).astype(np.uint8)
+                            prev["mask"] = (
+                                (prev["mask"].astype(bool) | frame.mask.astype(bool)).astype(
+                                    np.uint8
+                                )
                             )
+                            if prev["sop"] is None and frame.referenced_sop_instance_uid:
+                                prev["sop"] = frame.referenced_sop_instance_uid
                     if seg_ds is not None:
                         ref_series_uids = referenced_series_uids(seg_ds) or ref_series_uids
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"{choice.patient_id} instance {instance_id}: {exc}")
 
-            if not sop_to_mask:
+            if not plane_masks:
                 errors.append(f"{choice.patient_id}: no liver SEG frames extracted")
                 continue
 
-            for sop_uid, mask in tqdm(
-                sop_to_mask.items(),
-                desc=f"  {choice.patient_id}",
-                leave=False,
-            ):
-                orthanc_instance = client.find_instance_by_sop_uid(sop_uid)
-                if not orthanc_instance:
-                    errors.append(f"{choice.patient_id}: CT SOP not in Orthanc: {sop_uid}")
+            if not ref_series_uids:
+                errors.append(f"{choice.patient_id}: SEG has no ReferencedSeriesSequence")
+                continue
+
+            ct_instances = load_ct_series_instances(client, ref_series_uids[0])
+            if not ct_instances:
+                errors.append(
+                    f"{choice.patient_id}: referenced CT series not found: {ref_series_uids[0]}"
+                )
+                continue
+
+            by_sop = {inst["sop"]: inst for inst in ct_instances}
+            by_ipp = group_instances_by_ipp(ct_instances, decimals=args.ipp_decimals)
+            dual_acq = max(len(v) for v in by_ipp.values()) > 1
+            slice_spacing = estimate_slice_spacing_mm(ct_instances)
+            # For planes without SOP refs, allow about half a slice of mismatch.
+            geom_tol = max(args.match_tol_mm, 0.6 * slice_spacing)
+            plane_list = list(plane_masks.values())
+            z_mapping = choose_stack_z_mapping(plane_list, by_sop, ct_instances, geom_tol)
+
+            ct_masks: dict[str, dict] = {}
+            unmatched = 0
+            for plane in plane_list:
+                targets, match_mode = find_ct_targets(
+                    plane["sop"],
+                    plane["geometry"].ipp,
+                    by_sop,
+                    ct_instances,
+                    by_ipp,
+                    args.ipp_decimals,
+                    geom_tol,
+                    z_mapping=z_mapping,
+                )
+                if not targets:
+                    unmatched += 1
                     continue
 
+                for twin in targets:
+                    aligned = resample_mask_to_geometry(
+                        plane["mask"], plane["geometry"], twin["geometry"]
+                    )
+                    alignment = describe_alignment(plane["geometry"], twin["geometry"])
+                    alignment["match_mode"] = match_mode
+                    prev = ct_masks.get(twin["sop"])
+                    if prev is None:
+                        ct_masks[twin["sop"]] = {
+                            "mask": aligned,
+                            "orthanc_id": twin["orthanc_id"],
+                            "alignment": alignment,
+                            "source_seg_sop": plane["sop"],
+                        }
+                    else:
+                        prev["mask"] = (
+                            (prev["mask"].astype(bool) | aligned.astype(bool)).astype(np.uint8)
+                        )
+
+            if unmatched:
+                errors.append(
+                    f"{choice.patient_id}: {unmatched}/{len(plane_masks)} SEG planes unmatched to CT"
+                )
+            if not ct_masks:
+                errors.append(f"{choice.patient_id}: no CT masks after alignment")
+                continue
+
+            for sop_uid, info in tqdm(ct_masks.items(), desc=f"  {choice.patient_id}", leave=False):
+                orthanc_instance = info["orthanc_id"]
                 try:
                     rendered = client.download_rendered(orthanc_instance, width=image_size)
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"{choice.patient_id}: render failed {sop_uid}: {exc}")
                     continue
 
-                mask_resized = resize_mask(mask, image_size)
+                mask_resized = resize_mask(info["mask"], image_size)
                 if args.skip_empty and mask_resized.max() == 0:
                     skipped_empty += 1
                     continue
@@ -175,9 +380,12 @@ def main() -> int:
                     "seg_series_description": choice.series_description,
                     "referenced_series_uids": ref_series_uids,
                     "sop_instance_uid": sop_uid,
+                    "source_seg_sop_instance_uid": info["source_seg_sop"],
                     "liver_segment_numbers": used_segments,
                     "liver_segment_number": used_segments[0] if used_segments else None,
                     "selection_reason": choice.selection_reason,
+                    "dual_acquisition_series": dual_acq,
+                    "alignment": info["alignment"],
                     "image_size": image_size,
                     "image_path": str(image_path.relative_to(args.output)),
                     "mask_path": str(mask_path.relative_to(args.output)),
