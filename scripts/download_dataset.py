@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Download paired CT rendered images + liver SEG masks from Orthanc.
 
-Aligns SEG masks onto CT geometry (IOP flips, IPP in-plane offsets) and
-expands dual-acquisition series so every CT twin at the same IPP gets a mask.
+Aligns SEG masks onto CT geometry (IOP flips, IPP in-plane offsets).
+
+For dual-acquisition CT series with SEG series 300, only the later acquisition
+(higher InstanceNumber at each IPP) is kept — SEG 300 was drawn on that pass.
 """
 
 from __future__ import annotations
@@ -73,6 +75,10 @@ def load_ct_series_instances(client: OrthancClient, series_uid: str) -> list[dic
     for iid in series.get("Instances") or []:
         tags = client.get_json(f"/instances/{iid}/simplified-tags")
         geom = geometry_from_tags(tags)
+        try:
+            instance_number = int(float(tags.get("InstanceNumber", 0)))
+        except (TypeError, ValueError):
+            instance_number = 0
         instances.append(
             {
                 "orthanc_id": iid,
@@ -80,10 +86,60 @@ def load_ct_series_instances(client: OrthancClient, series_uid: str) -> list[dic
                 "ipp": geom.ipp,
                 "iop": geom.iop,
                 "geometry": geom,
+                "instance_number": instance_number,
                 "tags": tags,
             }
         )
     return instances
+
+
+def mark_dual_acquisition_passes(
+    ct_instances: list[dict],
+    by_ipp: dict[tuple, list[dict]],
+) -> bool:
+    """
+    Mark each instance with acquisition_pass: 0 = earlier, 1 = later.
+
+    Dual-acq twins are distinguished by InstanceNumber (AcquisitionTime is often
+    empty): the higher InstanceNumber at a given IPP is the later pass.
+    """
+    dual = any(len(group) > 1 for group in by_ipp.values())
+    if not dual:
+        for inst in ct_instances:
+            inst["acquisition_pass"] = 0
+        return False
+
+    earlier_nums: list[int] = []
+    later_nums: list[int] = []
+    for group in by_ipp.values():
+        ordered = sorted(group, key=lambda x: (x["instance_number"], x["sop"]))
+        if len(ordered) == 1:
+            continue
+        for i, inst in enumerate(ordered):
+            inst["acquisition_pass"] = 1 if i == len(ordered) - 1 else 0
+        earlier_nums.append(ordered[0]["instance_number"])
+        later_nums.append(ordered[-1]["instance_number"])
+
+    # Lonely IPP slices (no twin): assign pass by InstanceNumber threshold.
+    if earlier_nums and later_nums:
+        threshold = 0.5 * (float(np.median(earlier_nums)) + float(np.median(later_nums)))
+    else:
+        threshold = float(np.median([inst["instance_number"] for inst in ct_instances]))
+    for group in by_ipp.values():
+        if len(group) != 1:
+            continue
+        inst = group[0]
+        inst["acquisition_pass"] = 1 if inst["instance_number"] >= threshold else 0
+    return True
+
+
+def later_acquisition_only(targets: list[dict]) -> list[dict]:
+    """Keep only the later dual-acq pass from a twin group."""
+    if not targets:
+        return []
+    if len(targets) == 1:
+        return targets
+    return [max(targets, key=lambda x: (x.get("acquisition_pass", 0), x["instance_number"]))]
 
 
 def estimate_slice_spacing_mm(ct_instances: list[dict]) -> float:
@@ -180,18 +236,22 @@ def find_ct_targets(
     ipp_decimals: int,
     match_tol_mm: float,
     z_mapping: dict | None = None,
+    second_pass_only: bool = False,
 ) -> tuple[list[dict], str]:
     """
     Resolve CT instance(s) for a SEG plane.
 
-    Prefer referenced SOP (+ dual-acq IPP twins). Otherwise match by slice
-    position along the CT normal using the chosen stack mapping.
+    Prefer referenced SOP. For dual-acq + SEG 300 (second_pass_only), remap to
+    the later acquisition twin and do not keep the earlier pass.
     """
     if frame_sop and frame_sop in by_sop:
         ct_inst = by_sop[frame_sop]
         twins = by_ipp.get(ipp_key(ct_inst["ipp"], ipp_decimals), [ct_inst])
+        if second_pass_only:
+            return later_acquisition_only(twins), "sop_second_pass"
         return twins, "sop"
 
+    # Geometric matching uses only eligible instances (already filtered if needed).
     if not ct_instances:
         return [], "none"
 
@@ -206,6 +266,8 @@ def find_ct_targets(
     ct_inst = ct_instances[best_i]
     twins = by_ipp.get(ipp_key(ct_inst["ipp"], ipp_decimals), [ct_inst])
     mode = (z_mapping or {}).get("mode", "identity")
+    if second_pass_only:
+        return later_acquisition_only(twins), f"geom_z:{mode}:second_pass:{best_dz:.3f}"
     return twins, f"geom_z:{mode}:{best_dz:.3f}"
 
 
@@ -298,12 +360,22 @@ def main() -> int:
 
             by_sop = {inst["sop"]: inst for inst in ct_instances}
             by_ipp = group_instances_by_ipp(ct_instances, decimals=args.ipp_decimals)
-            dual_acq = max(len(v) for v in by_ipp.values()) > 1
-            slice_spacing = estimate_slice_spacing_mm(ct_instances)
-            # For planes without SOP refs, allow about half a slice of mismatch.
+            dual_acq = mark_dual_acquisition_passes(ct_instances, by_ipp)
+            # SEG series 300 on dual-acq was drawn on the later pass only.
+            second_pass_only = dual_acq and choice.series_number == 300
+            match_instances = (
+                [inst for inst in ct_instances if inst.get("acquisition_pass", 0) == 1]
+                if second_pass_only
+                else ct_instances
+            )
+            if second_pass_only and not match_instances:
+                errors.append(f"{choice.patient_id}: dual-acq but no later-pass CT instances")
+                continue
+
+            slice_spacing = estimate_slice_spacing_mm(match_instances)
             geom_tol = max(args.match_tol_mm, 0.6 * slice_spacing)
             plane_list = list(plane_masks.values())
-            z_mapping = choose_stack_z_mapping(plane_list, by_sop, ct_instances, geom_tol)
+            z_mapping = choose_stack_z_mapping(plane_list, by_sop, match_instances, geom_tol)
 
             ct_masks: dict[str, dict] = {}
             unmatched = 0
@@ -312,22 +384,26 @@ def main() -> int:
                     plane["sop"],
                     plane["geometry"].ipp,
                     by_sop,
-                    ct_instances,
+                    match_instances,
                     by_ipp,
                     args.ipp_decimals,
                     geom_tol,
                     z_mapping=z_mapping,
+                    second_pass_only=second_pass_only,
                 )
                 if not targets:
                     unmatched += 1
                     continue
 
                 for twin in targets:
+                    if second_pass_only and twin.get("acquisition_pass", 0) != 1:
+                        continue
                     aligned = resample_mask_to_geometry(
                         plane["mask"], plane["geometry"], twin["geometry"]
                     )
                     alignment = describe_alignment(plane["geometry"], twin["geometry"])
                     alignment["match_mode"] = match_mode
+                    alignment["acquisition_pass"] = twin.get("acquisition_pass")
                     prev = ct_masks.get(twin["sop"])
                     if prev is None:
                         ct_masks[twin["sop"]] = {
@@ -335,6 +411,8 @@ def main() -> int:
                             "orthanc_id": twin["orthanc_id"],
                             "alignment": alignment,
                             "source_seg_sop": plane["sop"],
+                            "acquisition_pass": twin.get("acquisition_pass"),
+                            "instance_number": twin.get("instance_number"),
                         }
                     else:
                         prev["mask"] = (
@@ -385,6 +463,9 @@ def main() -> int:
                     "liver_segment_number": used_segments[0] if used_segments else None,
                     "selection_reason": choice.selection_reason,
                     "dual_acquisition_series": dual_acq,
+                    "dual_acq_second_pass_only": second_pass_only,
+                    "acquisition_pass": info.get("acquisition_pass"),
+                    "instance_number": info.get("instance_number"),
                     "alignment": info["alignment"],
                     "image_size": image_size,
                     "image_path": str(image_path.relative_to(args.output)),
