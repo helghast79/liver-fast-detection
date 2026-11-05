@@ -102,9 +102,9 @@ def main() -> int:
                 continue
 
             # Prefer a single multi-frame SEG instance; process all if needed.
-            sop_to_mask: dict[str, object] = {}
+            sop_to_mask: dict[str, np.ndarray] = {}
             seg_ds = None
-            used_segment = choice.liver_segment_number
+            used_segments = list(choice.liver_segment_numbers)
             ref_series_uids: list[str] = []
 
             for instance_id in instance_ids:
@@ -112,13 +112,14 @@ def main() -> int:
                     seg_bytes = client.download_instance_file(instance_id)
                     frames, seg_ds = extract_liver_frames(
                         seg_bytes,
-                        liver_segment_number=choice.liver_segment_number,
+                        liver_segment_numbers=choice.liver_segment_numbers,
                         series_number=choice.series_number,
+                        series_description=choice.series_description,
                     )
                     if frames:
-                        used_segment = frames[0].segment_number
+                        used_segments = frames[0].segment_numbers
                     for frame in frames:
-                        # If multiple frames map to same SOP, OR the masks.
+                        # If multiple frames/segments map to same SOP, OR the masks.
                         prev = sop_to_mask.get(frame.referenced_sop_instance_uid)
                         if prev is None:
                             sop_to_mask[frame.referenced_sop_instance_uid] = frame.mask
@@ -174,7 +175,8 @@ def main() -> int:
                     "seg_series_description": choice.series_description,
                     "referenced_series_uids": ref_series_uids,
                     "sop_instance_uid": sop_uid,
-                    "liver_segment_number": used_segment,
+                    "liver_segment_numbers": used_segments,
+                    "liver_segment_number": used_segments[0] if used_segments else None,
                     "selection_reason": choice.selection_reason,
                     "image_size": image_size,
                     "image_path": str(image_path.relative_to(args.output)),

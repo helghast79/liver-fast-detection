@@ -15,46 +15,46 @@ from PIL import Image
 class FrameMask:
     referenced_sop_instance_uid: str
     referenced_series_instance_uid: str | None
-    segment_number: int
+    segment_numbers: list[int]
     mask: np.ndarray  # uint8 HxW, values 0/1
 
 
-def _get_segment_label(seg_ds: Dataset, segment_number: int) -> str:
-    for item in getattr(seg_ds, "SegmentSequence", []) or []:
-        if int(getattr(item, "SegmentNumber", -1)) == segment_number:
-            return str(getattr(item, "SegmentLabel", "")).strip()
-    return ""
-
-
-def resolve_liver_segment_number(seg_ds: Dataset, preferred: int, series_number: int) -> int:
+def resolve_segment_numbers(
+    seg_ds: Dataset,
+    preferred: list[int],
+    series_number: int,
+    series_description: str = "",
+) -> list[int]:
     """
-    Prefer the planned segment number; for series 999 also accept a segment
-    whose label contains 'liver' (case-insensitive).
+    Resolve which SegmentNumber(s) to include.
+
+    For series 300 keep preferred [1,2,3] when present.
+    For series 999 fall back to a label containing 'liver' if needed.
     """
     segments = list(getattr(seg_ds, "SegmentSequence", []) or [])
-    numbers = [int(getattr(s, "SegmentNumber", 0)) for s in segments]
+    available = {int(getattr(s, "SegmentNumber", 0)) for s in segments}
+    if not available:
+        raise ValueError("SEG has no SegmentSequence entries")
 
-    if preferred in numbers:
-        if series_number == 999:
-            label = _get_segment_label(seg_ds, preferred).lower()
-            if "liver" in label or preferred == 2:
-                return preferred
-            for seg in segments:
-                if "liver" in str(getattr(seg, "SegmentLabel", "")).lower():
-                    return int(seg.SegmentNumber)
-        return preferred
+    chosen = [n for n in preferred if n in available]
+    if chosen:
+        return chosen
 
-    for seg in segments:
-        if "liver" in str(getattr(seg, "SegmentLabel", "")).lower():
-            return int(seg.SegmentNumber)
+    # Label-based fallback for odd 999 layouts.
+    liver_labeled = [
+        int(s.SegmentNumber)
+        for s in segments
+        if "liver" in str(getattr(s, "SegmentLabel", "")).lower()
+    ]
+    if liver_labeled:
+        return liver_labeled
 
-    if numbers:
-        # Fallback: first segment for 300-style, second if available for 999.
-        if series_number == 999 and len(numbers) >= 2:
-            return numbers[1]
-        return numbers[0]
-
-    raise ValueError("SEG has no SegmentSequence entries")
+    numbers = sorted(available)
+    if series_number == 999 and "Spleen" in series_description and len(numbers) >= 2:
+        return [numbers[1]]
+    if series_number == 300:
+        return numbers[:3]
+    return [numbers[0]]
 
 
 def _referenced_sop_from_frame(frame_fg: Dataset) -> tuple[str | None, str | None]:
@@ -70,9 +70,7 @@ def _referenced_sop_from_frame(frame_fg: Dataset) -> tuple[str | None, str | Non
                 continue
             for src_item in src:
                 sop_uid = str(getattr(src_item, "ReferencedSOPInstanceUID", "") or "") or sop_uid
-                # Series UID is often only at ReferencedSeriesSequence level.
 
-    # Some SEGs put refs under PurposeOfReference / ReferencedImageSequence
     ref_img = getattr(frame_fg, "ReferencedImageSequence", None)
     if ref_img and sop_uid is None:
         for item in ref_img:
@@ -82,10 +80,6 @@ def _referenced_sop_from_frame(frame_fg: Dataset) -> tuple[str | None, str | Non
 
 
 def _series_uid_from_shared(seg_ds: Dataset) -> str | None:
-    shared = getattr(seg_ds, "SharedFunctionalGroupsSequence", None)
-    if shared:
-        # Rarely holds series refs; prefer top-level ReferencedSeriesSequence.
-        pass
     refs = getattr(seg_ds, "ReferencedSeriesSequence", None)
     if refs:
         return str(getattr(refs[0], "SeriesInstanceUID", "") or "") or None
@@ -98,24 +92,31 @@ def _pixel_array_frames(seg_ds: Dataset) -> np.ndarray:
     if arr.ndim == 2:
         arr = arr[np.newaxis, ...]
     elif arr.ndim == 4:
-        # (frames, H, W, samples) — take first sample
         arr = arr[..., 0]
     return np.asarray(arr)
 
 
 def extract_liver_frames(
     seg_bytes: bytes,
-    liver_segment_number: int,
+    liver_segment_numbers: list[int],
     series_number: int,
+    series_description: str = "",
 ) -> tuple[list[FrameMask], Dataset]:
+    """
+    Extract per-SOP masks, OR-merging all requested segment numbers onto each SOP.
+    """
     seg_ds = pydicom.dcmread(io.BytesIO(seg_bytes))
-    segment_number = resolve_liver_segment_number(seg_ds, liver_segment_number, series_number)
+    segment_numbers = resolve_segment_numbers(
+        seg_ds,
+        preferred=liver_segment_numbers,
+        series_number=series_number,
+        series_description=series_description,
+    )
     series_uid = _series_uid_from_shared(seg_ds)
     series_sops = referenced_sop_uids_in_series(seg_ds, series_uid)
 
-    # Prefer highdicom when available (handles fragmented / multi-frame SEG cleanly).
     try:
-        frames = _extract_with_highdicom(seg_bytes, segment_number, series_uid)
+        frames = _extract_with_highdicom(seg_bytes, segment_numbers, series_uid)
         if frames:
             return frames, seg_ds
     except Exception:
@@ -128,58 +129,62 @@ def extract_liver_frames(
         per_frame = per_frame[:n]
         pixels = pixels[:n]
 
-    frames = []
+    wanted = set(segment_numbers)
+    merged: dict[str, np.ndarray] = {}
     liver_frame_i = 0
     for idx, frame_fg in enumerate(per_frame):
         seg_id = getattr(frame_fg, "SegmentIdentificationSequence", None)
         frame_seg_num = None
         if seg_id:
             frame_seg_num = int(getattr(seg_id[0], "ReferencedSegmentNumber", -1))
-        if frame_seg_num != segment_number:
+        if frame_seg_num not in wanted:
             continue
 
         sop_uid, _ = _referenced_sop_from_frame(frame_fg)
         if not sop_uid and liver_frame_i < len(series_sops):
-            # Fallback: some SEGs only list SOPs under ReferencedSeriesSequence.
             sop_uid = series_sops[liver_frame_i]
         liver_frame_i += 1
         if not sop_uid:
             continue
 
         mask = (pixels[idx] > 0).astype(np.uint8)
-        frames.append(
-            FrameMask(
-                referenced_sop_instance_uid=sop_uid,
-                referenced_series_instance_uid=series_uid,
-                segment_number=segment_number,
-                mask=mask,
-            )
-        )
+        prev = merged.get(sop_uid)
+        if prev is None:
+            merged[sop_uid] = mask
+        else:
+            merged[sop_uid] = (prev.astype(bool) | mask.astype(bool)).astype(np.uint8)
 
+    frames = [
+        FrameMask(
+            referenced_sop_instance_uid=sop_uid,
+            referenced_series_instance_uid=series_uid,
+            segment_numbers=segment_numbers,
+            mask=mask,
+        )
+        for sop_uid, mask in merged.items()
+    ]
     return frames, seg_ds
 
 
 def _extract_with_highdicom(
     seg_bytes: bytes,
-    segment_number: int,
+    segment_numbers: list[int],
     series_uid: str | None,
 ) -> list[FrameMask]:
     from highdicom.seg.sop import Segmentation
 
     seg = Segmentation.from_dataset(pydicom.dcmread(io.BytesIO(seg_bytes)))
     source_uids = seg.get_source_image_uids()
-    # Each entry is (StudyInstanceUID, SeriesInstanceUID, SOPInstanceUID)
     sop_uids = [str(uids[2]) for uids in source_uids]
     if not sop_uids:
         return []
 
     pixels = seg.get_pixels_by_source_instance(
         source_sop_instance_uids=sop_uids,
-        segment_numbers=[segment_number],
+        segment_numbers=segment_numbers,
         combine_segments=True,
     )
     arr = np.asarray(pixels)
-    # Expected shapes: (N, H, W) or (N, H, W, 1)
     if arr.ndim == 4:
         arr = arr[..., 0]
     if arr.ndim == 2:
@@ -192,7 +197,7 @@ def _extract_with_highdicom(
             FrameMask(
                 referenced_sop_instance_uid=sop_uid,
                 referenced_series_instance_uid=series_uid,
-                segment_number=segment_number,
+                segment_numbers=list(segment_numbers),
                 mask=mask,
             )
         )
