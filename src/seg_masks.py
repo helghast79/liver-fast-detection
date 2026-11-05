@@ -23,6 +23,9 @@ class FrameMask:
     merge_key: str  # stable key used to OR-merge segments on the same plane
 
 
+AORTA_LABEL = "abdominal aorta"
+
+
 def resolve_segment_numbers(
     seg_ds: Dataset,
     preferred: list[int],
@@ -33,6 +36,19 @@ def resolve_segment_numbers(
     available = {int(getattr(s, "SegmentNumber", 0)) for s in segments}
     if not available:
         raise ValueError("SEG has no SegmentSequence entries")
+
+    # Series 300: merge every segment except Abdominal aorta (usually last).
+    if series_number == 300:
+        chosen = [
+            int(s.SegmentNumber)
+            for s in segments
+            if AORTA_LABEL not in str(getattr(s, "SegmentLabel", "")).strip().lower()
+        ]
+        if chosen:
+            return sorted(chosen)
+        # Fallback if labels are missing: drop the highest SegmentNumber.
+        numbers = sorted(available)
+        return numbers[:-1] if len(numbers) > 1 else numbers
 
     chosen = [n for n in preferred if n in available]
     if chosen:
@@ -49,8 +65,6 @@ def resolve_segment_numbers(
     numbers = sorted(available)
     if series_number == 999 and "Spleen" in series_description and len(numbers) >= 2:
         return [numbers[1]]
-    if series_number == 300:
-        return numbers[:3]
     return [numbers[0]]
 
 

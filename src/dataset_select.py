@@ -25,9 +25,9 @@ class SegChoice:
     selection_reason: str
 
     @property
-    def liver_segment_number(self) -> int:
-        """Primary segment number (first of the merge set)."""
-        return self.liver_segment_numbers[0]
+    def liver_segment_number(self) -> int | None:
+        """Primary segment number (first of the merge set), if known yet."""
+        return self.liver_segment_numbers[0] if self.liver_segment_numbers else None
 
 
 def _main_tags(resource: dict[str, Any]) -> dict[str, Any]:
@@ -54,15 +54,16 @@ def liver_segments_for_series(series_number: int, series_description: str) -> tu
     """
     Return (segment_numbers_to_merge, reason).
 
-    - Series 300: merge segments 1+2+3 (Liver, Mass, Portal vein)
+    - Series 300: merge all segments except 'Abdominal aorta' (resolved from SEG tags)
     - Series 999 'Seg of Spleen, Liver': segment 2 (Liver)
     - Series 999 'Seg of Liver': segment 1 (Liver)
     """
     description = series_description.strip()
     if series_number == 300:
+        # Empty preferred list => resolve_segment_numbers selects all non-aorta segments.
         return (
-            [1, 2, 3],
-            "SEG SeriesNumber 300; liver = merge segments 1+2+3 (Liver, Mass, Portal vein)",
+            [],
+            "SEG SeriesNumber 300; liver = merge all segments except 'Abdominal aorta'",
         )
     if series_number == 999 and description == SEG_DESC_999_SPLEEN_LIVER:
         return (
