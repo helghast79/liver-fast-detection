@@ -611,9 +611,9 @@ def main() -> int:
         "device_name": device_name,
     }
     notes = [
-        "Orthanc-rendered 128×128 grayscale PNGs (not raw HU).",
+        f"Training inputs at {image_size}×{image_size} (see run description for intensity pipeline).",
         "SEG labels merge all segments except Abdominal aorta.",
-        "2D TinyUNet [8,16,32,64]; BCE+Dice; patient-wise val split.",
+        f"2D TinyUNet base={args.base_channels} [c,2c,4c,8c]; BCE+Dice; patient-wise val split.",
         "Fixed holdout under data/holdout excluded from train/val.",
         f"Early stop on val_loss with patience={args.patience}, min_delta={args.min_delta}.",
         "Inference artifact for browser: INT8 dynamically quantized ONNX (CPU ORT timing).",

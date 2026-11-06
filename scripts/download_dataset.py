@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Download paired CT rendered images + liver SEG masks from Orthanc.
+"""Download paired CT images + liver SEG masks from Orthanc.
+
+Supports:
+  - Orthanc /rendered grayscale PNGs (legacy)
+  - DICOM → HU → fixed abdomen window → grayscale PNG (preferred)
 
 Aligns SEG masks onto CT geometry (IOP flips, IPP in-plane offsets).
 
@@ -26,6 +30,7 @@ import numpy as np
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+from src.ct_preprocess import WindowSpec, dicom_bytes_to_windowed_png
 from src.dataset_select import select_all_patients
 from src.geometry import (
     describe_alignment,
@@ -48,6 +53,24 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "data" / "raw")
     parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument(
+        "--source",
+        choices=("hu", "rendered"),
+        default="hu",
+        help="Image intensity source: DICOM HU+window (hu) or Orthanc /rendered",
+    )
+    parser.add_argument(
+        "--window-center",
+        type=float,
+        default=40.0,
+        help="Abdomen window center in HU (used with --source hu)",
+    )
+    parser.add_argument(
+        "--window-width",
+        type=float,
+        default=400.0,
+        help="Abdomen window width in HU (used with --source hu)",
+    )
     parser.add_argument("--skip-empty", action="store_true")
     parser.add_argument("--limit-patients", type=int, default=None)
     parser.add_argument("--patient-id", type=str, default=None)
@@ -285,6 +308,15 @@ def main() -> int:
         choices = choices[: args.limit_patients]
 
     print(f"Selected {len(choices)} patient(s) with usable SEG series")
+    window = WindowSpec(center=args.window_center, width=args.window_width)
+    print(
+        f"Image source={args.source} size={image_size}"
+        + (
+            f" window=C{window.center}/W{window.width}"
+            if args.source == "hu"
+            else ""
+        )
+    )
     args.output.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output / "manifest.jsonl"
 
@@ -429,10 +461,23 @@ def main() -> int:
 
             for sop_uid, info in tqdm(ct_masks.items(), desc=f"  {choice.patient_id}", leave=False):
                 orthanc_instance = info["orthanc_id"]
+                intensity_meta: dict = {}
                 try:
-                    rendered = client.download_rendered(orthanc_instance, width=image_size)
+                    if args.source == "hu":
+                        dicom_bytes = client.download_instance_file(orthanc_instance)
+                        png_bytes, intensity_meta = dicom_bytes_to_windowed_png(
+                            dicom_bytes,
+                            size=image_size,
+                            window=window,
+                        )
+                    else:
+                        png_bytes = client.download_rendered(
+                            orthanc_instance, width=image_size
+                        )
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{choice.patient_id}: render failed {sop_uid}: {exc}")
+                    errors.append(
+                        f"{choice.patient_id}: {args.source} failed {sop_uid}: {exc}"
+                    )
                     continue
 
                 mask_resized = resize_mask(info["mask"], image_size)
@@ -443,7 +488,7 @@ def main() -> int:
                 stem = sop_uid.replace(".", "_")
                 image_path = img_dir / f"{stem}.png"
                 mask_path = mask_dir / f"{stem}.png"
-                save_image_bytes(rendered, str(image_path), size=image_size)
+                save_image_bytes(png_bytes, str(image_path), size=image_size)
                 save_mask_png(mask_resized, str(mask_path))
 
                 record = {
@@ -468,6 +513,10 @@ def main() -> int:
                     "instance_number": info.get("instance_number"),
                     "alignment": info["alignment"],
                     "image_size": image_size,
+                    "image_source": args.source,
+                    "window_center": window.center if args.source == "hu" else None,
+                    "window_width": window.width if args.source == "hu" else None,
+                    "intensity_meta": intensity_meta or None,
                     "image_path": str(image_path.relative_to(args.output)),
                     "mask_path": str(mask_path.relative_to(args.output)),
                     "mask_foreground_pixels": int(mask_resized.sum()),
