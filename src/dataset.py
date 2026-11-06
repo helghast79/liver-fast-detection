@@ -56,6 +56,41 @@ def patient_split(
     return train_rows, val_rows, val_patient_ids
 
 
+def patient_kfold_splits(
+    rows: list[dict],
+    n_val_patients: int = 20,
+    seed: int = 42,
+) -> list[tuple[list[dict], list[dict], list[str]]]:
+    """
+    Patient-wise cross-validation folds with ~n_val_patients per fold.
+
+    Builds as many non-overlapping folds of exactly n_val_patients as fit.
+    Leftover patients remain in the training set for every fold.
+    Returns list of (train_rows, val_rows, val_patient_ids) per fold.
+    """
+    patients = sorted({r["patient_id"] for r in rows})
+    if len(patients) < 2:
+        return [(rows, [], [])]
+
+    n_val = min(max(1, n_val_patients), len(patients) - 1)
+    n_folds = max(1, len(patients) // n_val)
+    rng = random.Random(seed)
+    shuffled = patients[:]
+    rng.shuffle(shuffled)
+
+    folds: list[tuple[list[dict], list[dict], list[str]]] = []
+    for fold_i in range(n_folds):
+        start = fold_i * n_val
+        val_ids = sorted(shuffled[start : start + n_val])
+        val_set = set(val_ids)
+        train_rows = [r for r in rows if r["patient_id"] not in val_set]
+        val_rows = [r for r in rows if r["patient_id"] in val_set]
+        if not train_rows or not val_rows:
+            continue
+        folds.append((train_rows, val_rows, val_ids))
+    return folds
+
+
 def filter_existing_pairs(data_root: Path, rows: list[dict]) -> list[dict]:
     """Drop manifest rows whose image/mask files are missing on disk."""
     kept: list[dict] = []

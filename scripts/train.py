@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train TinyUNet on liver CT/mask pairs (single GPU, patient-wise val split)."""
+"""Train TinyUNet on liver CT/mask pairs (single GPU, patient-wise val / CV)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,13 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.dataset import LiverSegDataset, filter_existing_pairs, load_manifest, patient_split
+from src.dataset import (
+    LiverSegDataset,
+    filter_existing_pairs,
+    load_manifest,
+    patient_kfold_splits,
+    patient_split,
+)
 from src.model import TinyUNet, bce_dice_loss, soft_dice, soft_iou
 from src.train_monitor import MetricsStore, start_dashboard
 
@@ -44,7 +50,18 @@ def parse_args() -> argparse.Namespace:
         "--val-patients",
         type=int,
         default=10,
-        help="Number of random patients held out for validation",
+        help="Number of random patients held out for validation (per fold if --cv)",
+    )
+    parser.add_argument(
+        "--cv",
+        action="store_true",
+        help="Patient-wise cross-validation with --val-patients per fold",
+    )
+    parser.add_argument(
+        "--compare-to",
+        type=str,
+        default="",
+        help="Prior run_name in experiment_log.md to cite in the comparison section",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--base-channels", type=int, default=8)
@@ -232,6 +249,8 @@ def append_experiment_log(
     holdout_metrics: dict | None,
     inference: dict | None,
     notes: list[str],
+    comparison: dict | None = None,
+    cv_summary: dict | None = None,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -256,11 +275,39 @@ def append_experiment_log(
             "```json",
             json.dumps(val_metrics, indent=2),
             "```",
+        ]
+    )
+    if cv_summary is not None:
+        lines.extend(
+            [
+                "",
+                "### Cross-validation summary",
+                "```json",
+                json.dumps(cv_summary, indent=2),
+                "```",
+            ]
+        )
+    lines.extend(
+        [
             "",
             "### Holdout",
             "```json",
             json.dumps(holdout_metrics if holdout_metrics is not None else {"error": "not evaluated"}, indent=2),
             "```",
+        ]
+    )
+    if comparison is not None:
+        lines.extend(
+            [
+                "",
+                "### Comparison vs prior run",
+                "```json",
+                json.dumps(comparison, indent=2),
+                "```",
+            ]
+        )
+    lines.extend(
+        [
             "",
             "### Inference artifact",
             "```json",
@@ -275,103 +322,122 @@ def append_experiment_log(
         f.write("\n".join(lines))
 
 
-def main() -> int:
-    args = parse_args()
-    # Pin to a single GPU before CUDA initializes.
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    load_dotenv(ROOT / ".env")
-    set_seed(args.seed)
+def load_prior_run_from_log(log_path: Path, run_name: str) -> dict | None:
+    """Parse holdout + val JSON blocks for a named ## section in experiment_log.md."""
+    if not log_path.exists() or not run_name:
+        return None
+    text = log_path.read_text(encoding="utf-8")
+    marker = f"## {run_name}"
+    start = text.find(marker)
+    if start < 0:
+        return None
+    rest = text[start + len(marker) :]
+    nxt = rest.find("\n## ")
+    section = rest if nxt < 0 else rest[:nxt]
 
-    image_size = args.image_size or int(os.getenv("IMAGE_SIZE", "128"))
-    args.output.mkdir(parents=True, exist_ok=True)
-    ckpt_dir = args.output / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    experiment_log = args.experiment_log or (args.output / "experiment_log.md")
-    started = datetime.now(timezone.utc)
-    run_name = args.run_name or f"baseline-retrain-{started.strftime('%Y%m%d-%H%M%S')}"
-    description = args.description or (
-        "Retrain after carving a fixed 10-patient holdout from data/raw. "
-        "Same model/data pipeline as first run (rendered 128 PNG, TinyUNet base=8, BCE+Dice), "
-        "with softer early-stopping (patience=15, min_delta=5e-5) and live metrics dashboard."
-    )
+    def _extract(heading: str) -> dict | None:
+        h = f"### {heading}"
+        i = section.find(h)
+        if i < 0:
+            return None
+        j = section.find("```json", i)
+        if j < 0:
+            return None
+        k = section.find("```", j + 7)
+        if k < 0:
+            return None
+        try:
+            return json.loads(section[j + 7 : k].strip())
+        except json.JSONDecodeError:
+            return None
 
-    store = MetricsStore()
-    dashboard = None
-    if not args.no_dashboard:
-        dashboard = start_dashboard(args.dashboard_host, args.dashboard_port, store)
-        print(
-            f"Training dashboard: http://{args.dashboard_host}:{args.dashboard_port}/ "
-            f"(bind {args.dashboard_host})"
-        )
+    return {
+        "run_name": run_name,
+        "val": _extract("Validation (best checkpoint)"),
+        "holdout": _extract("Holdout"),
+        "inference": _extract("Inference artifact"),
+        "params": _extract("Train parameters"),
+    }
 
-    rows = filter_existing_pairs(args.data, load_manifest(args.data))
-    if not rows:
-        print(f"No usable pairs under {args.data}")
-        return 1
 
-    train_rows, val_rows, val_patients = patient_split(
-        rows,
-        n_val_patients=args.val_patients,
-        seed=args.seed,
-    )
-    split_path = args.output / "split.json"
-    split_path.write_text(
-        json.dumps(
-            {
-                "seed": args.seed,
-                "val_patients": val_patients,
-                "n_train_patients": len({r["patient_id"] for r in train_rows}),
-                "n_val_patients": len(val_patients),
-                "n_train_slices": len(train_rows),
-                "n_val_slices": len(val_rows),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+def metric_delta(new: float | None, old: float | None) -> dict | None:
+    if new is None or old is None:
+        return None
+    return {"new": new, "old": old, "delta": float(new) - float(old)}
 
-    holdout_rows: list[dict] = []
-    holdout_patients: list[str] = []
-    if args.holdout.exists() and (args.holdout / "manifest.jsonl").exists():
-        holdout_rows = filter_existing_pairs(args.holdout, load_manifest(args.holdout))
-        holdout_patients = sorted({r["patient_id"] for r in holdout_rows})
 
-    print(
-        f"Slices: {len(rows)} usable | train={len(train_rows)} val={len(val_rows)}\n"
-        f"Patients: train={len({r['patient_id'] for r in train_rows})} "
-        f"val={len(val_patients)} -> {val_patients}\n"
-        f"Holdout: {len(holdout_rows)} slices / {len(holdout_patients)} patients -> {holdout_patients}\n"
-        f"GPU: physical {args.gpu} (CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})"
-    )
+def build_comparison(prior: dict | None, holdout_metrics: dict | None, val_metrics: dict) -> dict | None:
+    if prior is None:
+        return None
+    prior_h = prior.get("holdout") or {}
+    prior_v = prior.get("val") or {}
+    out: dict = {"prior_run": prior.get("run_name"), "holdout": {}, "validation": {}}
+    if holdout_metrics:
+        for key in ("loss", "dice", "iou", "hard_dice", "precision", "recall"):
+            d = metric_delta(holdout_metrics.get(key), prior_h.get(key))
+            if d is not None:
+                out["holdout"][key] = d
+    for key in ("best_val_loss", "best_dice", "loss", "dice", "iou", "hard_dice", "precision", "recall"):
+        d = metric_delta(val_metrics.get(key), prior_v.get(key))
+        if d is not None:
+            out["validation"][key] = d
+    return out
 
-    train_ds = LiverSegDataset(args.data, train_rows, augment=True, seed=args.seed)
-    val_ds = LiverSegDataset(args.data, val_rows, augment=False, seed=args.seed)
+
+def make_loaders(
+    data_root: Path,
+    train_rows: list[dict],
+    val_rows: list[dict],
+    *,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+) -> tuple[DataLoader, DataLoader, LiverSegDataset, LiverSegDataset]:
+    train_ds = LiverSegDataset(data_root, train_rows, augment=True, seed=seed)
+    val_ds = LiverSegDataset(data_root, val_rows, augment=False, seed=seed)
     train_loader = DataLoader(
         train_ds,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=num_workers > 0,
     )
+    return train_loader, val_loader, train_ds, val_ds
 
-    if not torch.cuda.is_available():
-        print("WARNING: CUDA not available — training on CPU")
-        device = torch.device("cpu")
-        device_name = "cpu"
-    else:
-        device = torch.device("cuda:0")
-        device_name = torch.cuda.get_device_name(0)
-        print(f"Using device {device} ({device_name})")
 
+def train_one_fold(
+    *,
+    train_rows: list[dict],
+    val_rows: list[dict],
+    val_patients: list[str],
+    data_root: Path,
+    device: torch.device,
+    args: argparse.Namespace,
+    image_size: int,
+    ckpt_dir: Path,
+    best_path: Path,
+    store: MetricsStore,
+    run_label: str,
+    fold_tag: str = "",
+) -> dict:
+    """Train one split; returns fold result dict including best metrics/paths."""
+    train_loader, val_loader, train_ds, val_ds = make_loaders(
+        data_root,
+        train_rows,
+        val_rows,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seed=args.seed,
+    )
     model = TinyUNet(in_channels=1, out_channels=1, base=args.base_channels).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -381,27 +447,28 @@ def main() -> int:
     best_val_metrics: dict[str, float] = {}
     best_epoch = 0
     epochs_without_improve = 0
-    best_path = ckpt_dir / "best.pt"
+    last_path = ckpt_dir / ("last.pt" if not fold_tag else f"last_{fold_tag}.pt")
 
     store.update(
         status="running",
-        run_name=run_name,
+        run_name=run_label,
         max_epochs=args.epochs,
         patience=args.patience,
-        device=device_name,
         history=[],
         epoch=0,
         best_epoch=0,
         best_val_loss=None,
         best_dice=None,
         epochs_without_improve=0,
+        fold=fold_tag or None,
         updated_at=datetime.now(timezone.utc).isoformat(),
     )
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_losses = []
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
+        desc = f"{fold_tag + ' ' if fold_tag else ''}Epoch {epoch}/{args.epochs}"
+        pbar = tqdm(train_loader, desc=desc)
         for batch in pbar:
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
@@ -418,18 +485,17 @@ def main() -> int:
         record = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
         history.append(record)
         print(
-            f"epoch {epoch}: train_loss={train_metrics['loss']:.4f} "
+            f"{fold_tag + ' ' if fold_tag else ''}epoch {epoch}: "
+            f"train_loss={train_metrics['loss']:.4f} "
             f"val_loss={val_metrics['loss']:.4f} "
             f"val_dice={val_metrics['dice']:.4f} val_iou={val_metrics['iou']:.4f} "
             f"hard_dice={val_metrics['hard_dice']:.4f} "
             f"P={val_metrics['precision']:.4f} R={val_metrics['recall']:.4f}"
         )
 
-        improved = False
         if not np.isnan(val_metrics["loss"]) and (
             best_val_loss - val_metrics["loss"] > args.min_delta
         ):
-            improved = True
             best_val_loss = val_metrics["loss"]
             best_dice = val_metrics["dice"]
             best_val_metrics = dict(val_metrics)
@@ -444,6 +510,7 @@ def main() -> int:
                     "image_size": image_size,
                     "base_channels": args.base_channels,
                     "val_patients": val_patients,
+                    "fold": fold_tag or None,
                 },
                 best_path,
             )
@@ -461,7 +528,7 @@ def main() -> int:
                 "image_size": image_size,
                 "base_channels": args.base_channels,
             },
-            ckpt_dir / "last.pt",
+            last_path,
         )
 
         store.update(
@@ -473,6 +540,7 @@ def main() -> int:
             best_val_loss=best_val_loss if best_epoch else None,
             best_dice=best_dice if best_epoch else None,
             epochs_without_improve=epochs_without_improve,
+            fold=fold_tag or None,
             updated_at=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -484,15 +552,300 @@ def main() -> int:
             )
             break
 
+    if best_path.exists():
+        state = torch.load(best_path, map_location=device, weights_only=False)
+        model.load_state_dict(state["model_state_dict"])
+
+    return {
+        "model": model,
+        "train_loader": train_loader,
+        "val_loader": val_loader,
+        "train_ds": train_ds,
+        "val_ds": val_ds,
+        "history": history,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "best_dice": best_dice,
+        "best_val_metrics": best_val_metrics,
+        "best_path": best_path,
+        "early_stopped": epochs_without_improve >= args.patience,
+        "val_patients": val_patients,
+        "n_train": len(train_rows),
+        "n_val": len(val_rows),
+        "epochs_ran": history[-1]["epoch"] if history else 0,
+    }
+
+
+def export_and_benchmark(
+    *,
+    best_path: Path,
+    output: Path,
+    image_size: int,
+    base_channels: int,
+    holdout_root: Path,
+    holdout_rows: list[dict],
+) -> dict | None:
+    onnx_path = output / f"liver_unet_{image_size}.onnx"
+    quant_path = output / f"liver_unet_{image_size}.quant.onnx"
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "export_onnx.py"),
+        "--checkpoint",
+        str(best_path),
+        "--output",
+        str(onnx_path),
+        "--image-size",
+        str(image_size),
+        "--base-channels",
+        str(base_channels),
+    ]
+    print("Exporting ONNX…")
+    env = os.environ.copy()
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONPATH"] = str(ROOT)
+    subprocess.check_call(cmd, env=env)
+
+    infer_onnx = quant_path if quant_path.exists() else onnx_path
+    if not holdout_rows or not infer_onnx.exists():
+        return {
+            "onnx_path": str(infer_onnx if infer_onnx.exists() else onnx_path),
+            "float_onnx_path": str(onnx_path),
+        }
+    print(f"Benchmarking ONNX inference on holdout ({infer_onnx.name})…")
+    inference_info = benchmark_onnx_holdout(infer_onnx, holdout_root, holdout_rows, image_size)
+    inference_info["float_onnx_path"] = str(onnx_path)
+    inference_info["float_onnx_size_bytes"] = onnx_path.stat().st_size if onnx_path.exists() else None
+    inference_info["float_onnx_size_human"] = (
+        human_bytes(onnx_path.stat().st_size) if onnx_path.exists() else None
+    )
+    print(
+        f"ONNX {infer_onnx.name}: {inference_info['onnx_size_human']}, "
+        f"avg case={inference_info['avg_case_seconds']:.3f}s "
+        f"({inference_info['n_cases']} cases), "
+        f"avg slice={inference_info['avg_slice_ms']:.2f}ms"
+    )
+    return inference_info
+
+
+def summarize_cv_folds(fold_results: list[dict]) -> dict:
+    keys = ["best_val_loss", "best_dice", "hard_dice", "precision", "recall", "iou"]
+    per_fold = []
+    for i, fr in enumerate(fold_results):
+        m = dict(fr["best_val_metrics"])
+        per_fold.append(
+            {
+                "fold": i,
+                "best_epoch": fr["best_epoch"],
+                "best_val_loss": fr["best_val_loss"],
+                "best_dice": fr["best_dice"],
+                "val_patients": fr["val_patients"],
+                "n_train": fr["n_train"],
+                "n_val": fr["n_val"],
+                "epochs_ran": fr["epochs_ran"],
+                **{k: m.get(k) for k in ("loss", "dice", "iou", "hard_dice", "precision", "recall")},
+            }
+        )
+    summary: dict = {"n_folds": len(fold_results), "folds": per_fold, "mean": {}, "std": {}}
+    for key in keys:
+        vals = []
+        for fr in fold_results:
+            if key in ("best_val_loss", "best_dice"):
+                vals.append(fr[key])
+            else:
+                vals.append(fr["best_val_metrics"].get(key, float("nan")))
+        vals_a = np.asarray(vals, dtype=np.float64)
+        summary["mean"][key] = float(np.nanmean(vals_a))
+        summary["std"][key] = float(np.nanstd(vals_a))
+    return summary
+
+
+def main() -> int:
+    args = parse_args()
+    # Pin to a single GPU before CUDA initializes.
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    load_dotenv(ROOT / ".env")
+    set_seed(args.seed)
+
+    image_size = args.image_size or int(os.getenv("IMAGE_SIZE", "128"))
+    args.output.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = args.output / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # Keep the shared experiment log at repo outputs/ even when --output is a run subdir.
+    experiment_log = args.experiment_log or (ROOT / "outputs" / "experiment_log.md")
+    started = datetime.now(timezone.utc)
+    run_name = args.run_name or f"baseline-retrain-{started.strftime('%Y%m%d-%H%M%S')}"
+    description = args.description or (
+        "Retrain after carving a fixed 10-patient holdout from data/raw. "
+        "Same model/data pipeline as first run (rendered 128 PNG, TinyUNet base=8, BCE+Dice), "
+        "with softer early-stopping (patience=15, min_delta=5e-5) and live metrics dashboard."
+    )
+    compare_to = args.compare_to or ""
+
+    store = MetricsStore()
+    dashboard = None
+    if not args.no_dashboard:
+        dashboard = start_dashboard(args.dashboard_host, args.dashboard_port, store)
+        print(
+            f"Training dashboard: http://{args.dashboard_host}:{args.dashboard_port}/ "
+            f"(bind {args.dashboard_host})"
+        )
+
+    rows = filter_existing_pairs(args.data, load_manifest(args.data))
+    if not rows:
+        print(f"No usable pairs under {args.data}")
+        return 1
+
+    holdout_rows: list[dict] = []
+    holdout_patients: list[str] = []
+    if args.holdout.exists() and (args.holdout / "manifest.jsonl").exists():
+        holdout_rows = filter_existing_pairs(args.holdout, load_manifest(args.holdout))
+        holdout_patients = sorted({r["patient_id"] for r in holdout_rows})
+
+    if not torch.cuda.is_available():
+        print("WARNING: CUDA not available — training on CPU")
+        device = torch.device("cpu")
+        device_name = "cpu"
+    else:
+        device = torch.device("cuda:0")
+        device_name = torch.cuda.get_device_name(0)
+        print(f"Using device {device} ({device_name})")
+
+    store.update(device=device_name)
+
+    fold_results: list[dict] = []
+    selected: dict
+
+    if args.cv:
+        folds = patient_kfold_splits(rows, n_val_patients=args.val_patients, seed=args.seed)
+        if not folds:
+            print("Could not build CV folds")
+            return 1
+        split_info = {
+            "mode": "patient_kfold",
+            "seed": args.seed,
+            "val_patients_per_fold": args.val_patients,
+            "n_folds": len(folds),
+            "folds": [
+                {
+                    "fold": i,
+                    "val_patients": vp,
+                    "n_train_patients": len({r["patient_id"] for r in tr}),
+                    "n_val_patients": len(vp),
+                    "n_train_slices": len(tr),
+                    "n_val_slices": len(vr),
+                }
+                for i, (tr, vr, vp) in enumerate(folds)
+            ],
+        }
+        (args.output / "split.json").write_text(json.dumps(split_info, indent=2), encoding="utf-8")
+        print(
+            f"CV: {len(folds)} folds × {args.val_patients} val patients | "
+            f"{len(rows)} slices | holdout={len(holdout_patients)} patients {holdout_patients}\n"
+            f"GPU: physical {args.gpu}"
+        )
+        for i, (train_rows, val_rows, val_patients) in enumerate(folds):
+            fold_tag = f"fold{i}"
+            print(
+                f"\n===== {fold_tag}/{len(folds) - 1} "
+                f"train={len(train_rows)} val={len(val_rows)} patients={val_patients} ====="
+            )
+            fr = train_one_fold(
+                train_rows=train_rows,
+                val_rows=val_rows,
+                val_patients=val_patients,
+                data_root=args.data,
+                device=device,
+                args=args,
+                image_size=image_size,
+                ckpt_dir=ckpt_dir,
+                best_path=ckpt_dir / f"best_{fold_tag}.pt",
+                store=store,
+                run_label=f"{run_name}/{fold_tag}",
+                fold_tag=fold_tag,
+            )
+            fold_results.append(fr)
+
+        # Select fold with lowest validation loss for deployment / holdout eval.
+        selected = min(fold_results, key=lambda fr: fr["best_val_loss"])
+        selected_idx = fold_results.index(selected)
+        # Promote selected fold checkpoint to best.pt for convenience.
+        best_path = ckpt_dir / "best.pt"
+        if selected["best_path"].exists():
+            state = torch.load(selected["best_path"], map_location="cpu", weights_only=False)
+            torch.save(state, best_path)
+            selected["best_path"] = best_path
+        print(
+            f"\nSelected fold{selected_idx} "
+            f"(val_loss={selected['best_val_loss']:.4f}, dice={selected['best_dice']:.4f})"
+        )
+        cv_summary = summarize_cv_folds(fold_results)
+        cv_summary["selected_fold"] = selected_idx
+    else:
+        train_rows, val_rows, val_patients = patient_split(
+            rows,
+            n_val_patients=args.val_patients,
+            seed=args.seed,
+        )
+        (args.output / "split.json").write_text(
+            json.dumps(
+                {
+                    "mode": "single_split",
+                    "seed": args.seed,
+                    "val_patients": val_patients,
+                    "n_train_patients": len({r["patient_id"] for r in train_rows}),
+                    "n_val_patients": len(val_patients),
+                    "n_train_slices": len(train_rows),
+                    "n_val_slices": len(val_rows),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(
+            f"Slices: {len(rows)} usable | train={len(train_rows)} val={len(val_rows)}\n"
+            f"Patients: train={len({r['patient_id'] for r in train_rows})} "
+            f"val={len(val_patients)} -> {val_patients}\n"
+            f"Holdout: {len(holdout_rows)} slices / {len(holdout_patients)} patients -> {holdout_patients}\n"
+            f"GPU: physical {args.gpu} (CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})"
+        )
+        selected = train_one_fold(
+            train_rows=train_rows,
+            val_rows=val_rows,
+            val_patients=val_patients,
+            data_root=args.data,
+            device=device,
+            args=args,
+            image_size=image_size,
+            ckpt_dir=ckpt_dir,
+            best_path=ckpt_dir / "best.pt",
+            store=store,
+            run_label=run_name,
+        )
+        fold_results = [selected]
+        cv_summary = None
+
+    model = selected["model"]
+    val_loader = selected["val_loader"]
+    val_ds = selected["val_ds"]
+    train_loader = selected["train_loader"]
+    history = selected["history"]
+    best_path = Path(selected["best_path"])
+    best_epoch = selected["best_epoch"]
+    best_val_loss = selected["best_val_loss"]
+    best_dice = selected["best_dice"]
+    best_val_metrics = selected["best_val_metrics"]
+    val_patients = selected["val_patients"]
+
     metrics = {
         "run_name": run_name,
         "description": description,
+        "cross_validation": bool(args.cv),
         "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
         "best_dice": best_dice,
         "best_val_metrics": best_val_metrics,
         "best_checkpoint": str(best_path),
-        "early_stopped": epochs_without_improve >= args.patience,
+        "early_stopped": selected["early_stopped"],
         "patience": args.patience,
         "min_delta": args.min_delta,
         "val_patients": val_patients,
@@ -500,19 +853,16 @@ def main() -> int:
         "history": history,
         "image_size": image_size,
         "base_channels": args.base_channels,
-        "num_train": len(train_rows),
-        "num_val": len(val_rows),
+        "num_train": selected["n_train"],
+        "num_val": selected["n_val"],
         "num_holdout": len(holdout_rows),
         "gpu": args.gpu,
         "device_name": device_name,
+        "cv_summary": cv_summary,
     }
     metrics_path = args.output / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(f"Wrote {metrics_path}")
-
-    if best_path.exists():
-        state = torch.load(best_path, map_location=device, weights_only=False)
-        model.load_state_dict(state["model_state_dict"])
 
     sample_loader = val_loader if len(val_ds) else train_loader
     save_samples(model, sample_loader, device, args.output / "samples")
@@ -532,6 +882,8 @@ def main() -> int:
         holdout_metrics["n_slices"] = len(holdout_rows)
         holdout_metrics["n_patients"] = len(holdout_patients)
         holdout_metrics["patients"] = holdout_patients
+        if args.cv:
+            holdout_metrics["selected_fold"] = cv_summary["selected_fold"] if cv_summary else None
         print(
             f"holdout: loss={holdout_metrics['loss']:.4f} "
             f"dice={holdout_metrics['dice']:.4f} iou={holdout_metrics['iou']:.4f} "
@@ -542,56 +894,43 @@ def main() -> int:
         metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     inference_info = None
-    onnx_path = args.output / f"liver_unet_{image_size}.onnx"
-    quant_path = args.output / f"liver_unet_{image_size}.quant.onnx"
     if args.export_onnx and best_path.exists():
-        cmd = [
-            sys.executable,
-            str(ROOT / "scripts" / "export_onnx.py"),
-            "--checkpoint",
-            str(best_path),
-            "--output",
-            str(onnx_path),
-            "--image-size",
-            str(image_size),
-            "--base-channels",
-            str(args.base_channels),
-        ]
-        print("Exporting ONNX…")
-        env = os.environ.copy()
-        env["PYTHONNOUSERSITE"] = "1"
-        env["PYTHONPATH"] = str(ROOT)
-        subprocess.check_call(cmd, env=env)
-
-        # Prefer quantized model for browser inference timing/size reporting.
-        infer_onnx = quant_path if quant_path.exists() else onnx_path
-        if holdout_rows and infer_onnx.exists():
-            print(f"Benchmarking ONNX inference on holdout ({infer_onnx.name})…")
-            inference_info = benchmark_onnx_holdout(
-                infer_onnx, args.holdout, holdout_rows, image_size
-            )
-            inference_info["float_onnx_path"] = str(onnx_path)
-            inference_info["float_onnx_size_bytes"] = (
-                onnx_path.stat().st_size if onnx_path.exists() else None
-            )
-            inference_info["float_onnx_size_human"] = (
-                human_bytes(onnx_path.stat().st_size) if onnx_path.exists() else None
-            )
-            print(
-                f"ONNX {infer_onnx.name}: {inference_info['onnx_size_human']}, "
-                f"avg case={inference_info['avg_case_seconds']:.3f}s "
-                f"({inference_info['n_cases']} cases), "
-                f"avg slice={inference_info['avg_slice_ms']:.2f}ms"
-            )
+        inference_info = export_and_benchmark(
+            best_path=best_path,
+            output=args.output,
+            image_size=image_size,
+            base_channels=args.base_channels,
+            holdout_root=args.holdout,
+            holdout_rows=holdout_rows,
+        )
+        if inference_info is not None:
             metrics["inference"] = inference_info
             metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    val_log = {
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "best_dice": best_dice,
+        **best_val_metrics,
+    }
+    if args.cv and cv_summary is not None:
+        val_log["selected_fold"] = cv_summary["selected_fold"]
+        val_log["cv_mean_val_loss"] = cv_summary["mean"]["best_val_loss"]
+        val_log["cv_std_val_loss"] = cv_summary["std"]["best_val_loss"]
+        val_log["cv_mean_dice"] = cv_summary["mean"]["best_dice"]
+        val_log["cv_std_dice"] = cv_summary["std"]["best_dice"]
+
+    prior = load_prior_run_from_log(experiment_log, compare_to) if compare_to else None
+    comparison = build_comparison(prior, holdout_metrics, val_log)
 
     params = {
         "run_name": run_name,
         "data": str(args.data),
         "holdout": str(args.holdout),
+        "output": str(args.output),
+        "cross_validation": bool(args.cv),
         "epochs_max": args.epochs,
-        "epochs_ran": history[-1]["epoch"] if history else 0,
+        "epochs_ran": selected["epochs_ran"],
         "batch_size": args.batch_size,
         "lr": args.lr,
         "seed": args.seed,
@@ -604,34 +943,51 @@ def main() -> int:
         "loss": "BCE + soft Dice",
         "optimizer": "Adam",
         "augmentations": "flip/rot90/brightness-contrast",
-        "n_train_slices": len(train_rows),
-        "n_val_slices": len(val_rows),
+        "n_train_slices": selected["n_train"],
+        "n_val_slices": selected["n_val"],
         "n_holdout_slices": len(holdout_rows),
         "gpu": args.gpu,
         "device_name": device_name,
+        "compare_to": compare_to or None,
     }
+    if args.cv and cv_summary is not None:
+        params["n_folds"] = cv_summary["n_folds"]
+        params["selected_fold"] = cv_summary["selected_fold"]
+
     notes = [
         f"Training inputs at {image_size}×{image_size} (see run description for intensity pipeline).",
         "SEG labels merge all segments except Abdominal aorta.",
-        f"2D TinyUNet base={args.base_channels} [c,2c,4c,8c]; BCE+Dice; patient-wise val split.",
+        (
+            f"2D TinyUNet base={args.base_channels} [c,2c,4c,8c]; BCE+Dice; "
+            + (
+                f"patient-wise {cv_summary['n_folds']}-fold CV with {args.val_patients} val patients/fold."
+                if args.cv and cv_summary
+                else "patient-wise val split."
+            )
+        ),
         "Fixed holdout under data/holdout excluded from train/val.",
         f"Early stop on val_loss with patience={args.patience}, min_delta={args.min_delta}.",
         "Inference artifact for browser: INT8 dynamically quantized ONNX (CPU ORT timing).",
     ]
+    if args.cv and cv_summary is not None:
+        notes.append(
+            f"Deployment checkpoint = fold{cv_summary['selected_fold']} "
+            f"(lowest fold val_loss); CV mean±std logged separately."
+        )
+    if comparison is not None:
+        notes.append(f"Logged deltas vs prior run `{compare_to}`.")
+
     append_experiment_log(
         experiment_log,
         run_name=run_name,
         description=description,
         params=params,
-        val_metrics={
-            "best_epoch": best_epoch,
-            "best_val_loss": best_val_loss,
-            "best_dice": best_dice,
-            **best_val_metrics,
-        },
+        val_metrics=val_log,
         holdout_metrics=holdout_metrics,
         inference=inference_info,
         notes=notes,
+        comparison=comparison,
+        cv_summary=cv_summary,
     )
     print(f"Appended experiment log -> {experiment_log}")
 
@@ -644,6 +1000,7 @@ def main() -> int:
         best_dice=best_dice if best_epoch else None,
         holdout=holdout_metrics,
         inference=inference_info,
+        cv_summary=cv_summary,
         updated_at=datetime.now(timezone.utc).isoformat(),
     )
     if dashboard is not None:
@@ -651,8 +1008,6 @@ def main() -> int:
             f"Dashboard still serving final metrics at "
             f"http://{args.dashboard_host}:{args.dashboard_port}/ (Ctrl+C to stop if attached)"
         )
-        # Keep process alive briefly so the user can open the finished dashboard,
-        # but do not block forever when launched non-interactively.
         time.sleep(2)
 
     return 0
