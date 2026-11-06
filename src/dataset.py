@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -102,6 +103,50 @@ def filter_existing_pairs(data_root: Path, rows: list[dict]) -> list[dict]:
     return kept
 
 
+def series_key(row: dict) -> tuple:
+    """Group key for axial ordering within one CT acquisition stack."""
+    refs = row.get("referenced_series_uids") or []
+    ref0 = refs[0] if refs else ""
+    return (
+        row.get("patient_id", ""),
+        row.get("study_instance_uid", ""),
+        ref0,
+        row.get("acquisition_pass", 0),
+    )
+
+
+def sort_key_instance(row: dict) -> tuple:
+    return (
+        int(row.get("instance_number") or 0),
+        str(row.get("sop_instance_uid") or ""),
+    )
+
+
+def build_neighbor_index(rows: list[dict], context: int = 1) -> list[tuple[int, ...]]:
+    """
+    For each row index, return indices of [prev..., center, next...] with clamp.
+
+    Neighbors are among kept slices in the same series, sorted by InstanceNumber.
+    context=1 -> 3 channels (prev, center, next).
+    """
+    context = max(0, int(context))
+    groups: dict[tuple, list[int]] = defaultdict(list)
+    for i, row in enumerate(rows):
+        groups[series_key(row)].append(i)
+
+    neighbor_of = [tuple([i] * (2 * context + 1)) for i in range(len(rows))]
+    for idxs in groups.values():
+        idxs_sorted = sorted(idxs, key=lambda j: sort_key_instance(rows[j]))
+        n = len(idxs_sorted)
+        for pos, center_i in enumerate(idxs_sorted):
+            stack: list[int] = []
+            for d in range(-context, context + 1):
+                j = min(max(pos + d, 0), n - 1)
+                stack.append(idxs_sorted[j])
+            neighbor_of[center_i] = tuple(stack)
+    return neighbor_of
+
+
 class LiverSegDataset(Dataset):
     def __init__(
         self,
@@ -109,11 +154,19 @@ class LiverSegDataset(Dataset):
         rows: list[dict],
         augment: bool = False,
         seed: int = 0,
+        context_slices: int = 0,
     ) -> None:
+        """
+        context_slices=0 -> 1-channel center only.
+        context_slices=1 -> 3-channel stack [prev, center, next] with edge clamp.
+        """
         self.data_root = Path(data_root)
         self.rows = rows
         self.augment = augment
         self.rng = random.Random(seed)
+        self.context_slices = max(0, int(context_slices))
+        self.in_channels = 2 * self.context_slices + 1
+        self.neighbor_index = build_neighbor_index(rows, context=self.context_slices)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -125,26 +178,31 @@ class LiverSegDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         row = self.rows[idx]
-        image = self._load_gray(row["image_path"]) / 255.0
+        neighbor_idxs = self.neighbor_index[idx]
+        channels = [
+            self._load_gray(self.rows[j]["image_path"]) / 255.0 for j in neighbor_idxs
+        ]
+        # (C, H, W)
+        image = np.stack(channels, axis=0).astype(np.float32)
         mask = (self._load_gray(row["mask_path"]) > 127).astype(np.float32)
 
         if self.augment:
             if self.rng.random() < 0.5:
-                image = np.fliplr(image).copy()
+                image = np.flip(image, axis=2).copy()
                 mask = np.fliplr(mask).copy()
             if self.rng.random() < 0.5:
-                image = np.flipud(image).copy()
+                image = np.flip(image, axis=1).copy()
                 mask = np.flipud(mask).copy()
             if self.rng.random() < 0.3:
                 k = self.rng.randint(1, 3)
-                image = np.rot90(image, k).copy()
+                image = np.rot90(image, k, axes=(1, 2)).copy()
                 mask = np.rot90(mask, k).copy()
             if self.rng.random() < 0.5:
                 scale = self.rng.uniform(0.85, 1.15)
                 shift = self.rng.uniform(-0.05, 0.05)
                 image = np.clip(image * scale + shift, 0.0, 1.0)
 
-        image_t = torch.from_numpy(image).unsqueeze(0)
+        image_t = torch.from_numpy(np.ascontiguousarray(image))
         mask_t = torch.from_numpy(mask).unsqueeze(0)
         return {
             "image": image_t,

@@ -27,6 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=ROOT / "outputs" / "liver_unet_128.onnx")
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--base-channels", type=int, default=8)
+    parser.add_argument(
+        "--in-channels",
+        type=int,
+        default=None,
+        help="Input channels (default: read from checkpoint, else 1)",
+    )
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--quantize", action="store_true", default=True)
     parser.add_argument("--no-quantize", action="store_false", dest="quantize")
@@ -41,18 +47,30 @@ def export_onnx(
     image_size: int,
     base_channels: int,
     opset: int,
+    in_channels: int | None = None,
 ) -> Path:
     device = torch.device("cpu")
-    model = TinyUNet(in_channels=1, out_channels=1, base=base_channels).to(device)
     state = torch.load(checkpoint, map_location=device)
     if isinstance(state, dict) and "model_state_dict" in state:
-        model.load_state_dict(state["model_state_dict"])
+        if state.get("in_channels") is not None:
+            ckpt_in = int(state["in_channels"])
+        elif state.get("context_slices") is not None:
+            ckpt_in = 2 * int(state["context_slices"]) + 1
+        else:
+            ckpt_in = 1
+        weights = state["model_state_dict"]
+        base_channels = int(state.get("base_channels", base_channels))
+        image_size = int(state.get("image_size", image_size))
     else:
-        model.load_state_dict(state)
+        ckpt_in = 1
+        weights = state
+    in_ch = int(in_channels if in_channels is not None else ckpt_in)
+    model = TinyUNet(in_channels=in_ch, out_channels=1, base=base_channels).to(device)
+    model.load_state_dict(weights)
     model.eval()
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    dummy = torch.randn(1, 1, image_size, image_size, device=device)
+    dummy = torch.randn(1, in_ch, image_size, image_size, device=device)
     export_kwargs = dict(
         input_names=["input"],
         output_names=["logits"],
@@ -86,11 +104,11 @@ def quantize_onnx(onnx_path: Path) -> Path:
     return quant_path
 
 
-def smoke_test(onnx_path: Path, image_size: int, runs: int = 20) -> dict:
+def smoke_test(onnx_path: Path, image_size: int, in_channels: int = 1, runs: int = 20) -> dict:
     import onnxruntime as ort
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    x = np.random.randn(1, 1, image_size, image_size).astype(np.float32)
+    x = np.random.randn(1, in_channels, image_size, image_size).astype(np.float32)
     # warmup
     for _ in range(3):
         session.run(None, {"input": x})
@@ -110,24 +128,34 @@ def smoke_test(onnx_path: Path, image_size: int, runs: int = 20) -> dict:
 
 def main() -> int:
     args = parse_args()
+    state = torch.load(args.checkpoint, map_location="cpu")
+    if args.in_channels is not None:
+        in_ch = int(args.in_channels)
+    elif isinstance(state, dict) and state.get("in_channels") is not None:
+        in_ch = int(state["in_channels"])
+    elif isinstance(state, dict) and state.get("context_slices") is not None:
+        in_ch = 2 * int(state["context_slices"]) + 1
+    else:
+        in_ch = 1
     onnx_path = export_onnx(
         args.checkpoint,
         args.output,
         args.image_size,
         args.base_channels,
         args.opset,
+        in_channels=in_ch,
     )
-    print(f"Exported ONNX: {onnx_path} ({onnx_path.stat().st_size} bytes)")
+    print(f"Exported ONNX: {onnx_path} ({onnx_path.stat().st_size} bytes, in_channels={in_ch})")
 
     results = []
     if args.smoke_test:
-        results.append(smoke_test(onnx_path, args.image_size))
+        results.append(smoke_test(onnx_path, args.image_size, in_channels=in_ch))
 
     if args.quantize:
         quant_path = quantize_onnx(onnx_path)
         print(f"Quantized ONNX: {quant_path} ({quant_path.stat().st_size} bytes)")
         if args.smoke_test:
-            results.append(smoke_test(quant_path, args.image_size))
+            results.append(smoke_test(quant_path, args.image_size, in_channels=in_ch))
 
     for r in results:
         print(

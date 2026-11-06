@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--base-channels", type=int, default=8)
+    parser.add_argument(
+        "--context-slices",
+        type=int,
+        default=0,
+        help="Axial neighbors per side as extra channels (1 => prev/center/next = 3ch 2.5D)",
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=None)
     parser.add_argument(
@@ -170,7 +176,9 @@ def save_samples(
             if saved >= max_samples:
                 return
             stem = str(batch["sop_instance_uid"][i]).replace(".", "_")
-            img = (images[i, 0].cpu().numpy() * 255).astype(np.uint8)
+            # Center channel for multi-channel (2.5D) inputs.
+            center = images.shape[1] // 2
+            img = (images[i, center].cpu().numpy() * 255).astype(np.uint8)
             gt = (masks[i, 0].cpu().numpy() * 255).astype(np.uint8)
             pr = (preds[i, 0].cpu().numpy() * 255).astype(np.uint8)
             Image.fromarray(img, mode="L").save(out_dir / f"{stem}_image.png")
@@ -194,32 +202,52 @@ def benchmark_onnx_holdout(
     holdout_root: Path,
     rows: list[dict],
     image_size: int,
+    context_slices: int = 0,
 ) -> dict:
     """Average wall-clock time to infer one patient (all slices) with ONNX Runtime CPU."""
     import onnxruntime as ort
 
+    from src.dataset import LiverSegDataset
+
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    by_patient: dict[str, list[dict]] = defaultdict(list)
-    for row in rows:
-        by_patient[row["patient_id"]].append(row)
+    in_channels = 2 * max(0, context_slices) + 1
+    ds = LiverSegDataset(
+        holdout_root,
+        rows,
+        augment=False,
+        seed=0,
+        context_slices=context_slices,
+    )
+
+    by_patient: dict[str, list[int]] = defaultdict(list)
+    for i, row in enumerate(rows):
+        by_patient[row["patient_id"]].append(i)
 
     case_times_s: dict[str, float] = {}
     slice_times_ms: list[float] = []
-    # warmup
-    dummy = np.zeros((1, 1, image_size, image_size), dtype=np.float32)
+    dummy = np.zeros((1, in_channels, image_size, image_size), dtype=np.float32)
     for _ in range(3):
         session.run(None, {"input": dummy})
 
-    for patient_id, patient_rows in sorted(by_patient.items()):
+    for patient_id, idxs in sorted(by_patient.items()):
         t_case0 = time.perf_counter()
-        for row in patient_rows:
-            image = np.asarray(Image.open(holdout_root / row["image_path"]).convert("L"), dtype=np.float32)
-            if image.shape != (image_size, image_size):
-                image = np.asarray(
-                    Image.fromarray(image.astype(np.uint8)).resize((image_size, image_size), Image.BILINEAR),
-                    dtype=np.float32,
-                )
-            x = (image / 255.0)[None, None, ...].astype(np.float32)
+        for i in idxs:
+            image = ds[i]["image"].numpy()
+            if image.shape[-2:] != (image_size, image_size):
+                # rare; resize each channel
+                chans = []
+                for c in range(image.shape[0]):
+                    chans.append(
+                        np.asarray(
+                            Image.fromarray((image[c] * 255).astype(np.uint8)).resize(
+                                (image_size, image_size), Image.BILINEAR
+                            ),
+                            dtype=np.float32,
+                        )
+                        / 255.0
+                    )
+                image = np.stack(chans, axis=0)
+            x = image[None, ...].astype(np.float32)
             t0 = time.perf_counter()
             session.run(None, {"input": x})
             slice_times_ms.append((time.perf_counter() - t0) * 1000.0)
@@ -230,6 +258,8 @@ def benchmark_onnx_holdout(
         "onnx_path": str(onnx_path),
         "onnx_size_bytes": onnx_path.stat().st_size,
         "onnx_size_human": human_bytes(onnx_path.stat().st_size),
+        "in_channels": in_channels,
+        "context_slices": context_slices,
         "n_cases": len(values),
         "n_slices": len(slice_times_ms),
         "avg_case_seconds": float(np.mean(values)) if values else float("nan"),
@@ -392,9 +422,14 @@ def make_loaders(
     batch_size: int,
     num_workers: int,
     seed: int,
+    context_slices: int = 0,
 ) -> tuple[DataLoader, DataLoader, LiverSegDataset, LiverSegDataset]:
-    train_ds = LiverSegDataset(data_root, train_rows, augment=True, seed=seed)
-    val_ds = LiverSegDataset(data_root, val_rows, augment=False, seed=seed)
+    train_ds = LiverSegDataset(
+        data_root, train_rows, augment=True, seed=seed, context_slices=context_slices
+    )
+    val_ds = LiverSegDataset(
+        data_root, val_rows, augment=False, seed=seed, context_slices=context_slices
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -430,6 +465,7 @@ def train_one_fold(
     fold_tag: str = "",
 ) -> dict:
     """Train one split; returns fold result dict including best metrics/paths."""
+    in_channels = 2 * max(0, args.context_slices) + 1
     train_loader, val_loader, train_ds, val_ds = make_loaders(
         data_root,
         train_rows,
@@ -437,8 +473,11 @@ def train_one_fold(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         seed=args.seed,
+        context_slices=args.context_slices,
     )
-    model = TinyUNet(in_channels=1, out_channels=1, base=args.base_channels).to(device)
+    model = TinyUNet(
+        in_channels=in_channels, out_channels=1, base=args.base_channels
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     history: list[dict] = []
@@ -509,6 +548,8 @@ def train_one_fold(
                     "val": val_metrics,
                     "image_size": image_size,
                     "base_channels": args.base_channels,
+                    "in_channels": in_channels,
+                    "context_slices": args.context_slices,
                     "val_patients": val_patients,
                     "fold": fold_tag or None,
                 },
@@ -527,6 +568,8 @@ def train_one_fold(
                 "model_state_dict": model.state_dict(),
                 "image_size": image_size,
                 "base_channels": args.base_channels,
+                "in_channels": in_channels,
+                "context_slices": args.context_slices,
             },
             last_path,
         )
@@ -584,9 +627,12 @@ def export_and_benchmark(
     base_channels: int,
     holdout_root: Path,
     holdout_rows: list[dict],
+    context_slices: int = 0,
+    in_channels: int = 1,
 ) -> dict | None:
-    onnx_path = output / f"liver_unet_{image_size}.onnx"
-    quant_path = output / f"liver_unet_{image_size}.quant.onnx"
+    suffix = f"_{image_size}" if context_slices <= 0 else f"_{image_size}_2p5d"
+    onnx_path = output / f"liver_unet{suffix}.onnx"
+    quant_path = output / f"liver_unet{suffix}.quant.onnx"
     cmd = [
         sys.executable,
         str(ROOT / "scripts" / "export_onnx.py"),
@@ -598,6 +644,8 @@ def export_and_benchmark(
         str(image_size),
         "--base-channels",
         str(base_channels),
+        "--in-channels",
+        str(in_channels),
     ]
     print("Exporting ONNX…")
     env = os.environ.copy()
@@ -610,9 +658,17 @@ def export_and_benchmark(
         return {
             "onnx_path": str(infer_onnx if infer_onnx.exists() else onnx_path),
             "float_onnx_path": str(onnx_path),
+            "in_channels": in_channels,
+            "context_slices": context_slices,
         }
     print(f"Benchmarking ONNX inference on holdout ({infer_onnx.name})…")
-    inference_info = benchmark_onnx_holdout(infer_onnx, holdout_root, holdout_rows, image_size)
+    inference_info = benchmark_onnx_holdout(
+        infer_onnx,
+        holdout_root,
+        holdout_rows,
+        image_size,
+        context_slices=context_slices,
+    )
     inference_info["float_onnx_path"] = str(onnx_path)
     inference_info["float_onnx_size_bytes"] = onnx_path.stat().st_size if onnx_path.exists() else None
     inference_info["float_onnx_size_human"] = (
@@ -853,6 +909,8 @@ def main() -> int:
         "history": history,
         "image_size": image_size,
         "base_channels": args.base_channels,
+        "context_slices": args.context_slices,
+        "in_channels": 2 * max(0, args.context_slices) + 1,
         "num_train": selected["n_train"],
         "num_val": selected["n_val"],
         "num_holdout": len(holdout_rows),
@@ -869,7 +927,13 @@ def main() -> int:
 
     holdout_metrics = None
     if holdout_rows:
-        holdout_ds = LiverSegDataset(args.holdout, holdout_rows, augment=False, seed=args.seed)
+        holdout_ds = LiverSegDataset(
+            args.holdout,
+            holdout_rows,
+            augment=False,
+            seed=args.seed,
+            context_slices=args.context_slices,
+        )
         holdout_loader = DataLoader(
             holdout_ds,
             batch_size=args.batch_size,
@@ -894,6 +958,7 @@ def main() -> int:
         metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     inference_info = None
+    in_channels = 2 * max(0, args.context_slices) + 1
     if args.export_onnx and best_path.exists():
         inference_info = export_and_benchmark(
             best_path=best_path,
@@ -902,6 +967,8 @@ def main() -> int:
             base_channels=args.base_channels,
             holdout_root=args.holdout,
             holdout_rows=holdout_rows,
+            context_slices=args.context_slices,
+            in_channels=in_channels,
         )
         if inference_info is not None:
             metrics["inference"] = inference_info
@@ -937,12 +1004,14 @@ def main() -> int:
         "val_patients_n": args.val_patients,
         "val_patients": val_patients,
         "base_channels": args.base_channels,
+        "context_slices": args.context_slices,
+        "in_channels": in_channels,
         "image_size": image_size,
         "patience": args.patience,
         "min_delta": args.min_delta,
         "loss": "BCE + soft Dice",
         "optimizer": "Adam",
-        "augmentations": "flip/rot90/brightness-contrast",
+        "augmentations": "flip/rot90/brightness-contrast (shared across 2.5D channels)",
         "n_train_slices": selected["n_train"],
         "n_val_slices": selected["n_val"],
         "n_holdout_slices": len(holdout_rows),
@@ -958,12 +1027,18 @@ def main() -> int:
         f"Training inputs at {image_size}×{image_size} (see run description for intensity pipeline).",
         "SEG labels merge all segments except Abdominal aorta.",
         (
-            f"2D TinyUNet base={args.base_channels} [c,2c,4c,8c]; BCE+Dice; "
+            f"TinyUNet base={args.base_channels} [c,2c,4c,8c], in_channels={in_channels}; BCE+Dice; "
             + (
                 f"patient-wise {cv_summary['n_folds']}-fold CV with {args.val_patients} val patients/fold."
                 if args.cv and cv_summary
                 else "patient-wise val split."
             )
+        ),
+        (
+            f"2.5D: context_slices={args.context_slices} "
+            f"(channels=[prev..center..next], series-sorted by InstanceNumber, edge clamp)."
+            if args.context_slices > 0
+            else "2D single-slice input (1 channel)."
         ),
         "Fixed holdout under data/holdout excluded from train/val.",
         f"Early stop on val_loss with patience={args.patience}, min_delta={args.min_delta}.",
