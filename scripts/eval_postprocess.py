@@ -52,6 +52,30 @@ def parse_args() -> argparse.Namespace:
         default="hu-window-192",
         help="Base trained model this postprocess builds on",
     )
+    parser.add_argument(
+        "--context-slices",
+        type=int,
+        default=None,
+        help="Axial neighbors per side (default: read from checkpoint)",
+    )
+    parser.add_argument(
+        "--onnx",
+        type=Path,
+        default=None,
+        help="Quant/float ONNX path to cite in inference config (optional)",
+    )
+    parser.add_argument(
+        "--parent-metrics",
+        type=Path,
+        default=None,
+        help="Parent metrics.json for carrying timing (optional)",
+    )
+    parser.add_argument(
+        "--description",
+        type=str,
+        default="",
+        help="Experiment log description override",
+    )
     parser.add_argument("--experiment-log", type=Path, default=None)
     return parser.parse_args()
 
@@ -157,12 +181,18 @@ def append_log(
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    in_ch = params.get("in_channels", 1)
+    ctx = params.get("context_slices", 0)
     notes = [
         f"No retrain — postprocess on checkpoint from `{parent_run}`.",
         "Sweep probability thresholds with optional largest connected-component filter.",
         "Goal: cut false positives while preserving holdout hard Dice.",
-        "Same HU abdomen window (C40/W400) 192 inputs and TinyUNet weights.",
-        "ONNX artifact unchanged; viewer should apply chosen threshold + LCC.",
+        (
+            f"Same HU abdomen window (C40/W400) @ {params.get('image_size', 192)}; "
+            f"in_channels={in_ch}"
+            + (f" (2.5D context_slices={ctx})." if ctx else ".")
+        ),
+        "ONNX weights unchanged; viewer should apply chosen threshold + LCC after sigmoid.",
     ]
     body = [
         f"\n## {run_name}",
@@ -223,11 +253,27 @@ def main() -> int:
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     image_size = int(state.get("image_size", 192))
     base = int(state.get("base_channels", 8))
-    model = TinyUNet(in_channels=1, out_channels=1, base=base).to(device)
+    if args.context_slices is not None:
+        context_slices = int(args.context_slices)
+    elif state.get("context_slices") is not None:
+        context_slices = int(state["context_slices"])
+    elif state.get("in_channels") is not None:
+        # in_channels = 2*context + 1
+        context_slices = max(0, (int(state["in_channels"]) - 1) // 2)
+    else:
+        context_slices = 0
+    in_channels = 2 * context_slices + 1
+    model = TinyUNet(in_channels=in_channels, out_channels=1, base=base).to(device)
     model.load_state_dict(state["model_state_dict"])
     model.eval()
 
-    ds = LiverSegDataset(args.holdout, holdout_rows, augment=False, seed=0)
+    ds = LiverSegDataset(
+        args.holdout,
+        holdout_rows,
+        augment=False,
+        seed=0,
+        context_slices=context_slices,
+    )
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -236,7 +282,10 @@ def main() -> int:
         pin_memory=device.type == "cuda",
     )
 
-    print(f"Collecting probabilities on {len(holdout_rows)} holdout slices…")
+    print(
+        f"Collecting probabilities on {len(holdout_rows)} holdout slices "
+        f"(in_channels={in_channels}, context_slices={context_slices})…"
+    )
     probs, gts, soft = collect_probs(model, loader, device)
 
     sweep: list[dict] = []
@@ -263,6 +312,8 @@ def main() -> int:
         "checkpoint": str(args.checkpoint),
         "image_size": image_size,
         "base_channels": base,
+        "in_channels": in_channels,
+        "context_slices": context_slices,
         "soft": soft,
         "baseline": baseline,
         "selected": best,
@@ -274,14 +325,23 @@ def main() -> int:
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
     # Inference config for the viewer (same ONNX weights + postprocess knobs)
-    quant = args.output / f"liver_unet_{image_size}.quant.onnx"
-    float_onnx = args.output / f"liver_unet_{image_size}.onnx"
+    suffix = f"_{image_size}" if context_slices <= 0 else f"_{image_size}_2p5d"
+    quant = args.output / f"liver_unet{suffix}.quant.onnx"
+    float_onnx = args.output / f"liver_unet{suffix}.onnx"
+    if args.onnx is not None:
+        onnx_path = args.onnx
+    elif quant.exists():
+        onnx_path = quant
+    else:
+        onnx_path = float_onnx
     infer_cfg = {
         "parent_run": args.parent_run,
         "run_name": args.run_name,
-        "onnx_path": str(quant if quant.exists() else float_onnx),
+        "onnx_path": str(onnx_path),
         "float_onnx_path": str(float_onnx) if float_onnx.exists() else None,
         "image_size": image_size,
+        "in_channels": in_channels,
+        "context_slices": context_slices,
         "image_source": "hu",
         "window_center": 40.0,
         "window_width": 400.0,
@@ -299,6 +359,8 @@ def main() -> int:
         "onnx_size_bytes": Path(infer_cfg["onnx_path"]).stat().st_size
         if Path(infer_cfg["onnx_path"]).exists()
         else None,
+        "in_channels": in_channels,
+        "context_slices": context_slices,
         "note": (
             "Weights unchanged from parent run; apply threshold + optional largest-CC "
             "after sigmoid. Model forward time same as parent; postprocess is CPU/numpy."
@@ -307,8 +369,7 @@ def main() -> int:
         "recommended_keep_largest_cc": best["largest_cc"],
         "inference_config": str(cfg_path),
     }
-    # Carry parent timing if present in experiment metrics
-    parent_metrics = args.output / "metrics.json"
+    parent_metrics = args.parent_metrics or (args.output / "metrics.json")
     if parent_metrics.exists():
         try:
             pm = json.loads(parent_metrics.read_text())
@@ -316,6 +377,9 @@ def main() -> int:
                 inference["parent_avg_case_seconds"] = pm["inference"].get("avg_case_seconds")
                 inference["parent_avg_slice_ms"] = pm["inference"].get("avg_slice_ms")
                 inference["onnx_size_human"] = pm["inference"].get("onnx_size_human")
+                inference["onnx_size_bytes"] = inference.get("onnx_size_bytes") or pm[
+                    "inference"
+                ].get("onnx_size_bytes")
         except Exception:  # noqa: BLE001
             pass
 
@@ -332,19 +396,21 @@ def main() -> int:
         ),
         "image_size": image_size,
         "base_channels": base,
+        "in_channels": in_channels,
+        "context_slices": context_slices,
         "n_holdout_slices": len(holdout_rows),
     }
 
-    log_path = args.experiment_log or (args.output / "experiment_log.md")
+    log_path = args.experiment_log or (ROOT / "outputs" / "experiment_log.md")
+    description = args.description or (
+        f"Postprocess on `{args.parent_run}`: raise decision threshold and/or "
+        "keep largest connected component to cut false positives (no retrain)."
+    )
     append_log(
         log_path,
         run_name=args.run_name,
         parent_run=args.parent_run,
-        description=(
-            "Progressive improvement #4 (no retrain): raise decision threshold "
-            "and/or keep largest connected component on hu-window-192 predictions "
-            "to cut false positives."
-        ),
+        description=description,
         params=params,
         soft=soft,
         baseline=baseline,

@@ -68,6 +68,15 @@ RUN_META = [
         "input": "HU@192 3ch prev/c/next, 4×20 CV",
         "in_channels": 3,
     },
+    {
+        "run_name": "hu-window-192-cv20-2p5d-threshold-lcc",
+        "label": "HU-2.5D+LCC",
+        "family": "postprocess",
+        "input": "2.5D + thr/LCC",
+        "in_channels": 3,
+        "is_postprocess": True,
+        "parent_run": "hu-window-192-cv20-2p5d",
+    },
 ]
 
 
@@ -135,9 +144,9 @@ def build_rows(parsed: dict[str, dict]) -> list[dict]:
 
         is_pp = bool(meta.get("is_postprocess"))
         if is_pp:
-            soft = block.get("soft") or extract_holdout_soft_from_pp(
-                block, parsed.get("hu-window-192")
-            )
+            parent_name = meta.get("parent_run") or params.get("parent_run") or "hu-window-192"
+            parent = parsed.get(parent_name) or {}
+            soft = block.get("soft") or extract_holdout_soft_from_pp(block, parent)
             hard = block.get("selected_postprocess") or {}
             holdout_soft_dice = soft.get("dice")
             holdout_hard_dice = hard.get("hard_dice")
@@ -146,7 +155,7 @@ def build_rows(parsed: dict[str, dict]) -> list[dict]:
             holdout_recall = hard.get("recall")
             holdout_iou = soft.get("iou")
             holdout_loss = soft.get("loss")
-            parent_inf = (parsed.get("hu-window-192") or {}).get("inference") or {}
+            parent_inf = parent.get("inference") or {}
             avg_case = infer.get("parent_avg_case_seconds") or parent_inf.get("avg_case_seconds")
             avg_slice = infer.get("parent_avg_slice_ms") or parent_inf.get("avg_slice_ms")
             quant_bytes = infer.get("onnx_size_bytes") or parent_inf.get("onnx_size_bytes")
@@ -154,19 +163,20 @@ def build_rows(parsed: dict[str, dict]) -> list[dict]:
             image_size = params.get("image_size") or 192
             epochs_ran = None
             best_epoch = None
-            parent_val = (parsed.get("hu-window-192") or {}).get("val") or {}
+            parent_val = parent.get("val") or {}
             val_soft = parent_val.get("best_dice") or parent_val.get("dice")
             val_hard = parent_val.get("hard_dice")
             val_prec = parent_val.get("precision")
             val_rec = parent_val.get("recall")
             val_loss = parent_val.get("best_val_loss") or parent_val.get("loss")
-            # Postprocess holdout patient counts from parent
-            parent_hold = (parsed.get("hu-window-192") or {}).get("holdout") or {}
+            parent_hold = parent.get("holdout") or {}
             hold = {
                 "n_patients": parent_hold.get("n_patients"),
                 "n_slices": parent_hold.get("n_slices") or params.get("n_holdout_slices"),
             }
-            note = "No retrain; thr=0.8 + largest-CC on HU-192 probs"
+            thr = hard.get("threshold")
+            lcc = hard.get("largest_cc")
+            note = f"No retrain; thr={thr} LCC={lcc} on `{parent_name}`"
         else:
             holdout_soft_dice = hold.get("dice")
             holdout_hard_dice = hold.get("hard_dice")
@@ -308,8 +318,8 @@ def write_readme(rows: list[dict], path: Path) -> None:
             f"- Best holdout **soft Dice**: `{best_soft['label']}` ({best_soft['holdout_soft_dice']:.3f})",
             f"- Best holdout **hard Dice**: `{best_hard['label']}` ({best_hard['holdout_hard_dice']:.3f})",
             "- Holdout patients are fixed (11 after HCC_027 restored; render-128 logged with 10).",
-            "- `HU-192+LCC` is postprocess only (thr=0.8 + largest CC); weights = `HU-192`.",
-            "- `HU-192-CV20-2.5D` needs ONNX input `[1,3,192,192]` (prev/center/next).",
+            "- `HU-192+LCC` / `HU-2.5D+LCC` are postprocess only (thr+LCC); same ONNX as parent.",
+            "- `HU-192-CV20-2.5D` (+ LCC) needs ONNX input `[1,3,192,192]` (prev/center/next).",
             "",
             "## Artifacts",
             "- `comparison_metrics.csv` — tabular metrics",
