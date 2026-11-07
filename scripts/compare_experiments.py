@@ -84,6 +84,29 @@ RUN_META = [
         "input": "HU@192 3ch, single 10-val split",
         "in_channels": 3,
     },
+    {
+        "run_name": "hu-window-192-2p5d-base12",
+        "label": "HU-2.5D-b12",
+        "family": "DICOM HU + 2.5D capacity",
+        "input": "HU@192 3ch, base=12",
+        "in_channels": 3,
+    },
+    {
+        "run_name": "hu-window-192-2p5d-base12-threshold-lcc",
+        "label": "HU-b12+LCC",
+        "family": "postprocess",
+        "input": "base12 2.5D + thr/LCC",
+        "in_channels": 3,
+        "is_postprocess": True,
+        "parent_run": "hu-window-192-2p5d-base12",
+    },
+    {
+        "run_name": "hu-window-192-2p5d-base16",
+        "label": "HU-2.5D-b16",
+        "family": "DICOM HU + 2.5D capacity",
+        "input": "HU@192 3ch, base=16",
+        "in_channels": 3,
+    },
 ]
 
 
@@ -325,8 +348,9 @@ def write_readme(rows: list[dict], path: Path) -> None:
             f"- Best holdout **soft Dice**: `{best_soft['label']}` ({best_soft['holdout_soft_dice']:.3f})",
             f"- Best holdout **hard Dice**: `{best_hard['label']}` ({best_hard['holdout_hard_dice']:.3f})",
             "- Holdout patients are fixed (11 after HCC_027 restored; render-128 logged with 10).",
-            "- `HU-192+LCC` / `HU-2.5D+LCC` are postprocess only (thr+LCC); same ONNX as parent.",
-            "- `HU-192-CV20-2.5D` (+ LCC) needs ONNX input `[1,3,192,192]` (prev/center/next).",
+            "- `HU-192+LCC` / `HU-2.5D+LCC` / `HU-b12+LCC` are postprocess only (thr+LCC); same ONNX as parent.",
+            "- All 2.5D ONNX inputs are `[1,3,192,192]` (prev/center/next, edge clamp).",
+            "- Latency: `HU-2.5D-b12` ~1.86s/case (kept); `HU-2.5D-b16` ~3.06s (over ~2s budget).",
             "",
             "## Artifacts",
             "- `comparison_metrics.csv` — tabular metrics",
