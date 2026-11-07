@@ -72,10 +72,17 @@ RUN_META = [
         "run_name": "hu-window-192-cv20-2p5d-threshold-lcc",
         "label": "HU-2.5D+LCC",
         "family": "postprocess",
-        "input": "2.5D + thr/LCC",
+        "input": "2.5D CV + thr/LCC",
         "in_channels": 3,
         "is_postprocess": True,
         "parent_run": "hu-window-192-cv20-2p5d",
+    },
+    {
+        "run_name": "hu-window-192-2p5d",
+        "label": "HU-192-2.5D",
+        "family": "DICOM HU + 2.5D",
+        "input": "HU@192 3ch, single 10-val split",
+        "in_channels": 3,
     },
 ]
 
