@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from scipy import ndimage
 from torch.utils.data import Dataset
 
 
@@ -147,6 +148,18 @@ def build_neighbor_index(rows: list[dict], context: int = 1) -> list[tuple[int, 
     return neighbor_of
 
 
+def _approx_hu_from_windowed(gray01: np.ndarray, center: float = 40.0, width: float = 400.0) -> np.ndarray:
+    """Invert fixed abdomen window mapping (approx.) to HU for re-window jitter."""
+    lo = center - width / 2.0
+    return gray01.astype(np.float32) * width + lo
+
+
+def _apply_hu_window(hu: np.ndarray, center: float, width: float) -> np.ndarray:
+    lo = center - width / 2.0
+    hi = center + width / 2.0
+    return np.clip((hu - lo) / max(width, 1e-6), 0.0, 1.0).astype(np.float32)
+
+
 class LiverSegDataset(Dataset):
     def __init__(
         self,
@@ -155,18 +168,26 @@ class LiverSegDataset(Dataset):
         augment: bool = False,
         seed: int = 0,
         context_slices: int = 0,
+        strong_aug: bool = False,
+        base_window_center: float = 40.0,
+        base_window_width: float = 400.0,
     ) -> None:
         """
         context_slices=0 -> 1-channel center only.
         context_slices=1 -> 3-channel stack [prev, center, next] with edge clamp.
+        strong_aug adds CT-aware augs: small affine/elastic, HU window jitter,
+        gaussian noise, mild blur (on top of flip/rot/brightness).
         """
         self.data_root = Path(data_root)
         self.rows = rows
         self.augment = augment
+        self.strong_aug = bool(strong_aug)
         self.rng = random.Random(seed)
         self.context_slices = max(0, int(context_slices))
         self.in_channels = 2 * self.context_slices + 1
         self.neighbor_index = build_neighbor_index(rows, context=self.context_slices)
+        self.base_window_center = float(base_window_center)
+        self.base_window_width = float(base_window_width)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -175,6 +196,72 @@ class LiverSegDataset(Dataset):
         path = self.data_root / rel_path
         arr = np.asarray(Image.open(path).convert("L"), dtype=np.float32)
         return arr
+
+    def _affine_elastic(
+        self, image: np.ndarray, mask: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Small affine + optional mild elastic warp; shared across channels."""
+        _, h, w = image.shape
+        angle = self.rng.uniform(-12.0, 12.0)
+        scale = self.rng.uniform(0.92, 1.08)
+        tx = self.rng.uniform(-0.04, 0.04) * w
+        ty = self.rng.uniform(-0.04, 0.04) * h
+        rad = np.deg2rad(angle)
+        cos_a, sin_a = np.cos(rad) * scale, np.sin(rad) * scale
+        cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+        # scipy affine_transform uses (row, col) = (y, x)
+        a00, a01 = cos_a, sin_a
+        a10, a11 = -sin_a, cos_a
+        o_y = cy - a00 * (cy + ty) - a01 * (cx + tx)
+        o_x = cx - a10 * (cy + ty) - a11 * (cx + tx)
+        mat = np.array([[a00, a01], [a10, a11]], dtype=np.float64)
+        off = np.array([o_y, o_x], dtype=np.float64)
+
+        image_w = np.stack(
+            [
+                ndimage.affine_transform(
+                    image[c], matrix=mat, offset=off, order=1, mode="nearest", prefilter=False
+                )
+                for c in range(image.shape[0])
+            ],
+            axis=0,
+        ).astype(np.float32)
+        mask_w = ndimage.affine_transform(
+            mask, matrix=mat, offset=off, order=0, mode="nearest", prefilter=False
+        ).astype(np.float32)
+
+        if self.rng.random() < 0.5:
+            rs = np.random.RandomState(self.rng.randint(0, 1_000_000))
+            sigma = self.rng.uniform(4.0, 7.0)
+            alpha = self.rng.uniform(2.0, 6.0)
+            dy = ndimage.gaussian_filter(rs.uniform(-1, 1, size=(h, w)).astype(np.float32), sigma=sigma, mode="nearest") * alpha
+            dx = ndimage.gaussian_filter(rs.uniform(-1, 1, size=(h, w)).astype(np.float32), sigma=sigma, mode="nearest") * alpha
+            yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+            coords = [np.clip(yy + dy, 0, h - 1), np.clip(xx + dx, 0, w - 1)]
+            image_w = np.stack(
+                [
+                    ndimage.map_coordinates(image_w[c], coords, order=1, mode="nearest")
+                    for c in range(image_w.shape[0])
+                ],
+                axis=0,
+            ).astype(np.float32)
+            mask_w = ndimage.map_coordinates(mask_w, coords, order=0, mode="nearest").astype(np.float32)
+
+        return image_w, mask_w
+
+    def _hu_window_jitter(self, image: np.ndarray) -> np.ndarray:
+        """Re-window assuming PNGs were saved with base C40/W400."""
+        d_c = self.rng.uniform(-25.0, 25.0)
+        d_w = self.rng.uniform(-80.0, 80.0)
+        center = self.base_window_center + d_c
+        width = max(150.0, self.base_window_width + d_w)
+        out = []
+        for c in range(image.shape[0]):
+            hu = _approx_hu_from_windowed(
+                image[c], self.base_window_center, self.base_window_width
+            )
+            out.append(_apply_hu_window(hu, center, width))
+        return np.stack(out, axis=0).astype(np.float32)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         row = self.rows[idx]
@@ -202,8 +289,28 @@ class LiverSegDataset(Dataset):
                 shift = self.rng.uniform(-0.05, 0.05)
                 image = np.clip(image * scale + shift, 0.0, 1.0)
 
+            if self.strong_aug:
+                if self.rng.random() < 0.55:
+                    image, mask = self._affine_elastic(image, mask)
+                if self.rng.random() < 0.5:
+                    image = self._hu_window_jitter(image)
+                if self.rng.random() < 0.4:
+                    noise = np.random.RandomState(self.rng.randint(0, 1_000_000)).normal(
+                        0.0, self.rng.uniform(0.01, 0.04), size=image.shape
+                    ).astype(np.float32)
+                    image = np.clip(image + noise, 0.0, 1.0)
+                if self.rng.random() < 0.35:
+                    sigma = self.rng.uniform(0.3, 0.9)
+                    image = np.stack(
+                        [
+                            ndimage.gaussian_filter(image[c], sigma=sigma, mode="nearest")
+                            for c in range(image.shape[0])
+                        ],
+                        axis=0,
+                    ).astype(np.float32)
+
         image_t = torch.from_numpy(np.ascontiguousarray(image))
-        mask_t = torch.from_numpy(mask).unsqueeze(0)
+        mask_t = torch.from_numpy(np.ascontiguousarray(mask)).unsqueeze(0)
         return {
             "image": image_t,
             "mask": mask_t,

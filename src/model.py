@@ -78,6 +78,68 @@ def bce_dice_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return bce + dice_loss(logits, targets)
 
 
+def tversky_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.3,
+    beta: float = 0.7,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Soft Tversky loss. beta > alpha penalizes false negatives more (helps recall /
+    small / boundary misses).
+    """
+    probs = torch.sigmoid(logits)
+    targets = targets.float()
+    dims = (1, 2, 3)
+    tp = (probs * targets).sum(dim=dims)
+    fp = (probs * (1.0 - targets)).sum(dim=dims)
+    fn = ((1.0 - probs) * targets).sum(dim=dims)
+    tversky = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    return 1.0 - tversky.mean()
+
+
+def bce_tversky_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.3,
+    beta: float = 0.7,
+) -> torch.Tensor:
+    bce = F.binary_cross_entropy_with_logits(logits, targets.float())
+    return bce + tversky_loss(logits, targets, alpha=alpha, beta=beta)
+
+
+def boundary_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Light boundary-aware term: L1 on spatial gradients of probs vs masks.
+    Encourages sharper edges without a full Hausdorff implementation.
+    """
+    probs = torch.sigmoid(logits)
+    targets = targets.float()
+    # Finite differences along H/W
+    p_dh = probs[:, :, 1:, :] - probs[:, :, :-1, :]
+    p_dw = probs[:, :, :, 1:] - probs[:, :, :, :-1]
+    t_dh = targets[:, :, 1:, :] - targets[:, :, :-1, :]
+    t_dw = targets[:, :, :, 1:] - targets[:, :, :, :-1]
+    return (p_dh - t_dh).abs().mean() + (p_dw - t_dw).abs().mean() + eps * 0.0
+
+
+def bce_tversky_boundary_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.3,
+    beta: float = 0.7,
+    boundary_weight: float = 0.25,
+) -> torch.Tensor:
+    return bce_tversky_loss(logits, targets, alpha=alpha, beta=beta) + boundary_weight * boundary_loss(
+        logits, targets
+    )
+
+
 @torch.no_grad()
 def soft_dice(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> float:
     probs = (torch.sigmoid(logits) > 0.5).float()

@@ -34,7 +34,14 @@ from src.dataset import (
     patient_kfold_splits,
     patient_split,
 )
-from src.model import TinyUNet, bce_dice_loss, soft_dice, soft_iou
+from src.model import (
+    TinyUNet,
+    bce_dice_loss,
+    bce_tversky_boundary_loss,
+    bce_tversky_loss,
+    soft_dice,
+    soft_iou,
+)
 from src.train_monitor import MetricsStore, start_dashboard
 
 
@@ -70,6 +77,26 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Axial neighbors per side as extra channels (1 => prev/center/next = 3ch 2.5D)",
+    )
+    parser.add_argument(
+        "--strong-aug",
+        action="store_true",
+        help="CT-aware augs: small affine/elastic, HU window jitter, noise, blur",
+    )
+    parser.add_argument(
+        "--loss",
+        type=str,
+        default="bce_dice",
+        choices=["bce_dice", "bce_tversky", "bce_tversky_boundary"],
+        help="Training loss (val early-stop uses the same)",
+    )
+    parser.add_argument("--tversky-alpha", type=float, default=0.3, help="Tversky FP weight")
+    parser.add_argument("--tversky-beta", type=float, default=0.7, help="Tversky FN weight (β>α → recall)")
+    parser.add_argument(
+        "--boundary-weight",
+        type=float,
+        default=0.25,
+        help="Weight for boundary term when --loss bce_tversky_boundary",
     )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=None)
@@ -118,8 +145,50 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def make_loss_fn(args: argparse.Namespace):
+    if args.loss == "bce_dice":
+        return bce_dice_loss
+    if args.loss == "bce_tversky":
+
+        def _fn(logits, targets):
+            return bce_tversky_loss(
+                logits, targets, alpha=args.tversky_alpha, beta=args.tversky_beta
+            )
+
+        return _fn
+    if args.loss == "bce_tversky_boundary":
+
+        def _fn(logits, targets):
+            return bce_tversky_boundary_loss(
+                logits,
+                targets,
+                alpha=args.tversky_alpha,
+                beta=args.tversky_beta,
+                boundary_weight=args.boundary_weight,
+            )
+
+        return _fn
+    raise ValueError(f"Unknown loss: {args.loss}")
+
+
+def loss_label(args: argparse.Namespace) -> str:
+    if args.loss == "bce_dice":
+        return "BCE + soft Dice"
+    if args.loss == "bce_tversky":
+        return f"BCE + Tversky(α={args.tversky_alpha}, β={args.tversky_beta})"
+    return (
+        f"BCE + Tversky(α={args.tversky_alpha}, β={args.tversky_beta}) "
+        f"+ boundary×{args.boundary_weight}"
+    )
+
+
 @torch.no_grad()
-def evaluate(model: TinyUNet, loader: DataLoader, device: torch.device) -> dict[str, float]:
+def evaluate(
+    model: TinyUNet,
+    loader: DataLoader,
+    device: torch.device,
+    loss_fn=bce_dice_loss,
+) -> dict[str, float]:
     model.eval()
     if len(loader) == 0:
         return {
@@ -136,7 +205,7 @@ def evaluate(model: TinyUNet, loader: DataLoader, device: torch.device) -> dict[
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
         logits = model(images)
-        losses.append(float(bce_dice_loss(logits, masks).item()))
+        losses.append(float(loss_fn(logits, masks).item()))
         dices.append(soft_dice(logits, masks))
         ious.append(soft_iou(logits, masks))
         preds = (torch.sigmoid(logits) > 0.5).float()
@@ -423,12 +492,23 @@ def make_loaders(
     num_workers: int,
     seed: int,
     context_slices: int = 0,
+    strong_aug: bool = False,
 ) -> tuple[DataLoader, DataLoader, LiverSegDataset, LiverSegDataset]:
     train_ds = LiverSegDataset(
-        data_root, train_rows, augment=True, seed=seed, context_slices=context_slices
+        data_root,
+        train_rows,
+        augment=True,
+        seed=seed,
+        context_slices=context_slices,
+        strong_aug=strong_aug,
     )
     val_ds = LiverSegDataset(
-        data_root, val_rows, augment=False, seed=seed, context_slices=context_slices
+        data_root,
+        val_rows,
+        augment=False,
+        seed=seed,
+        context_slices=context_slices,
+        strong_aug=False,
     )
     train_loader = DataLoader(
         train_ds,
@@ -466,6 +546,7 @@ def train_one_fold(
 ) -> dict:
     """Train one split; returns fold result dict including best metrics/paths."""
     in_channels = 2 * max(0, args.context_slices) + 1
+    loss_fn = make_loss_fn(args)
     train_loader, val_loader, train_ds, val_ds = make_loaders(
         data_root,
         train_rows,
@@ -474,6 +555,7 @@ def train_one_fold(
         num_workers=args.num_workers,
         seed=args.seed,
         context_slices=args.context_slices,
+        strong_aug=bool(getattr(args, "strong_aug", False)),
     )
     model = TinyUNet(
         in_channels=in_channels, out_channels=1, base=args.base_channels
@@ -513,14 +595,14 @@ def train_one_fold(
             masks = batch["mask"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             logits = model(images)
-            loss = bce_dice_loss(logits, masks)
+            loss = loss_fn(logits, masks)
             loss.backward()
             optimizer.step()
             epoch_losses.append(float(loss.item()))
             pbar.set_postfix(loss=float(np.mean(epoch_losses[-20:])))
 
         train_metrics = {"loss": float(np.mean(epoch_losses)) if epoch_losses else float("nan")}
-        val_metrics = evaluate(model, val_loader, device)
+        val_metrics = evaluate(model, val_loader, device, loss_fn=loss_fn)
         record = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
         history.append(record)
         print(
@@ -942,7 +1024,7 @@ def main() -> int:
             pin_memory=True,
         )
         print("Evaluating holdout…")
-        holdout_metrics = evaluate(model, holdout_loader, device)
+        holdout_metrics = evaluate(model, holdout_loader, device, loss_fn=make_loss_fn(args))
         holdout_metrics["n_slices"] = len(holdout_rows)
         holdout_metrics["n_patients"] = len(holdout_patients)
         holdout_metrics["patients"] = holdout_patients
@@ -1009,9 +1091,18 @@ def main() -> int:
         "image_size": image_size,
         "patience": args.patience,
         "min_delta": args.min_delta,
-        "loss": "BCE + soft Dice",
+        "loss": loss_label(args),
+        "loss_name": args.loss,
+        "tversky_alpha": args.tversky_alpha if args.loss != "bce_dice" else None,
+        "tversky_beta": args.tversky_beta if args.loss != "bce_dice" else None,
+        "boundary_weight": args.boundary_weight if args.loss == "bce_tversky_boundary" else None,
         "optimizer": "Adam",
-        "augmentations": "flip/rot90/brightness-contrast (shared across 2.5D channels)",
+        "strong_aug": bool(args.strong_aug),
+        "augmentations": (
+            "flip/rot90/brightness + affine/elastic + HU-window jitter + noise/blur"
+            if args.strong_aug
+            else "flip/rot90/brightness-contrast (shared across 2.5D channels)"
+        ),
         "n_train_slices": selected["n_train"],
         "n_val_slices": selected["n_val"],
         "n_holdout_slices": len(holdout_rows),
@@ -1027,7 +1118,8 @@ def main() -> int:
         f"Training inputs at {image_size}×{image_size} (see run description for intensity pipeline).",
         "SEG labels merge all segments except Abdominal aorta.",
         (
-            f"TinyUNet base={args.base_channels} [c,2c,4c,8c], in_channels={in_channels}; BCE+Dice; "
+            f"TinyUNet base={args.base_channels} [c,2c,4c,8c], in_channels={in_channels}; "
+            f"{loss_label(args)}; "
             + (
                 f"patient-wise {cv_summary['n_folds']}-fold CV with {args.val_patients} val patients/fold."
                 if args.cv and cv_summary
@@ -1039,6 +1131,11 @@ def main() -> int:
             f"(channels=[prev..center..next], series-sorted by InstanceNumber, edge clamp)."
             if args.context_slices > 0
             else "2D single-slice input (1 channel)."
+        ),
+        (
+            "Strong CT-aware augs enabled (affine/elastic, HU window jitter, noise, blur)."
+            if args.strong_aug
+            else "Standard flip/rot/brightness augs."
         ),
         "Fixed holdout under data/holdout excluded from train/val.",
         f"Early stop on val_loss with patience={args.patience}, min_delta={args.min_delta}.",
