@@ -160,6 +160,15 @@ def _apply_hu_window(hu: np.ndarray, center: float, width: float) -> np.ndarray:
     return np.clip((hu - lo) / max(width, 1e-6), 0.0, 1.0).astype(np.float32)
 
 
+def spatial_channels(context_slices: int = 0) -> int:
+    return 2 * max(0, int(context_slices)) + 1
+
+
+def total_in_channels(context_slices: int = 0, dual_window: bool = False) -> int:
+    n = spatial_channels(context_slices)
+    return n * 2 if dual_window else n
+
+
 class LiverSegDataset(Dataset):
     def __init__(
         self,
@@ -171,10 +180,17 @@ class LiverSegDataset(Dataset):
         strong_aug: bool = False,
         base_window_center: float = 40.0,
         base_window_width: float = 400.0,
+        dual_window: bool = False,
+        bone_window_center: float = 400.0,
+        bone_window_width: float = 1500.0,
     ) -> None:
         """
         context_slices=0 -> 1-channel center only.
         context_slices=1 -> 3-channel stack [prev, center, next] with edge clamp.
+        dual_window appends a second HU window (bone/soft) per spatial slice:
+          [abd_prev..abd_next, bone_prev..bone_next] (or 2ch if context=0).
+        Bone channels are derived by approx-inverting the stored abdomen PNG
+        (assumed C40/W400) then re-windowing — no Orthanc /rendered.
         strong_aug adds CT-aware augs: small affine/elastic, HU window jitter,
         gaussian noise, mild blur (on top of flip/rot/brightness).
         """
@@ -182,12 +198,16 @@ class LiverSegDataset(Dataset):
         self.rows = rows
         self.augment = augment
         self.strong_aug = bool(strong_aug)
+        self.dual_window = bool(dual_window)
         self.rng = random.Random(seed)
         self.context_slices = max(0, int(context_slices))
-        self.in_channels = 2 * self.context_slices + 1
+        self.n_spatial = spatial_channels(self.context_slices)
+        self.in_channels = total_in_channels(self.context_slices, self.dual_window)
         self.neighbor_index = build_neighbor_index(rows, context=self.context_slices)
         self.base_window_center = float(base_window_center)
         self.base_window_width = float(base_window_width)
+        self.bone_window_center = float(bone_window_center)
+        self.bone_window_width = float(bone_window_width)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -249,28 +269,60 @@ class LiverSegDataset(Dataset):
 
         return image_w, mask_w
 
+    def _bone_from_abdomen(self, abd01: np.ndarray) -> np.ndarray:
+        hu = _approx_hu_from_windowed(
+            abd01, self.base_window_center, self.base_window_width
+        )
+        return _apply_hu_window(hu, self.bone_window_center, self.bone_window_width)
+
+    def _stack_windows(self, abd_spatial: np.ndarray) -> np.ndarray:
+        """(n_spatial,H,W) abdomen -> optional dual stack."""
+        if not self.dual_window:
+            return abd_spatial
+        bone = np.stack(
+            [self._bone_from_abdomen(abd_spatial[i]) for i in range(abd_spatial.shape[0])],
+            axis=0,
+        )
+        return np.concatenate([abd_spatial, bone], axis=0).astype(np.float32)
+
     def _hu_window_jitter(self, image: np.ndarray) -> np.ndarray:
-        """Re-window assuming PNGs were saved with base C40/W400."""
+        """
+        Jitter abdomen (+ bone if dual) from approx HU of abdomen spatial channels.
+        Assumes channel layout [abd_spatial..., bone_spatial...].
+        """
+        n = self.n_spatial
+        abd = image[:n]
         d_c = self.rng.uniform(-25.0, 25.0)
         d_w = self.rng.uniform(-80.0, 80.0)
-        center = self.base_window_center + d_c
-        width = max(150.0, self.base_window_width + d_w)
-        out = []
-        for c in range(image.shape[0]):
+        abd_c = self.base_window_center + d_c
+        abd_w = max(150.0, self.base_window_width + d_w)
+        out_abd = []
+        hus = []
+        for i in range(n):
             hu = _approx_hu_from_windowed(
-                image[c], self.base_window_center, self.base_window_width
+                abd[i], self.base_window_center, self.base_window_width
             )
-            out.append(_apply_hu_window(hu, center, width))
-        return np.stack(out, axis=0).astype(np.float32)
+            hus.append(hu)
+            out_abd.append(_apply_hu_window(hu, abd_c, abd_w))
+        out_abd_a = np.stack(out_abd, axis=0).astype(np.float32)
+        if not self.dual_window:
+            return out_abd_a
+        bone_c = self.bone_window_center + self.rng.uniform(-40.0, 40.0)
+        bone_w = max(600.0, self.bone_window_width + self.rng.uniform(-200.0, 200.0))
+        out_bone = np.stack(
+            [_apply_hu_window(hu, bone_c, bone_w) for hu in hus], axis=0
+        ).astype(np.float32)
+        return np.concatenate([out_abd_a, out_bone], axis=0)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         row = self.rows[idx]
         neighbor_idxs = self.neighbor_index[idx]
-        channels = [
+        abd_channels = [
             self._load_gray(self.rows[j]["image_path"]) / 255.0 for j in neighbor_idxs
         ]
-        # (C, H, W)
-        image = np.stack(channels, axis=0).astype(np.float32)
+        # (n_spatial, H, W) abdomen, then optional bone append
+        abd = np.stack(abd_channels, axis=0).astype(np.float32)
+        image = self._stack_windows(abd)
         mask = (self._load_gray(row["mask_path"]) > 127).astype(np.float32)
 
         if self.augment:

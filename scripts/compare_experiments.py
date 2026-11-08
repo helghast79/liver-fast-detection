@@ -114,6 +114,13 @@ RUN_META = [
         "input": "base12 2.5D + strong aug + Tversky/boundary",
         "in_channels": 3,
     },
+    {
+        "run_name": "hu-window-192-2p5d-base12-aug-tversky-dual",
+        "label": "HU-b12-augTvk-dual",
+        "family": "DICOM HU + 2.5D + dual window",
+        "input": "base12 2.5D 6ch abd+bone + strong aug + Tversky/boundary",
+        "in_channels": 6,
+    },
 ]
 
 

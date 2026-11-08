@@ -33,6 +33,7 @@ from src.dataset import (
     load_manifest,
     patient_kfold_splits,
     patient_split,
+    total_in_channels,
 )
 from src.model import (
     TinyUNet,
@@ -83,6 +84,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="CT-aware augs: small affine/elastic, HU window jitter, noise, blur",
     )
+    parser.add_argument(
+        "--dual-window",
+        action="store_true",
+        help="Append bone HU window channels (derived from abdomen PNG via approx HU)",
+    )
+    parser.add_argument("--bone-window-center", type=float, default=400.0)
+    parser.add_argument("--bone-window-width", type=float, default=1500.0)
     parser.add_argument(
         "--loss",
         type=str,
@@ -272,6 +280,9 @@ def benchmark_onnx_holdout(
     rows: list[dict],
     image_size: int,
     context_slices: int = 0,
+    dual_window: bool = False,
+    bone_window_center: float = 400.0,
+    bone_window_width: float = 1500.0,
 ) -> dict:
     """Average wall-clock time to infer one patient (all slices) with ONNX Runtime CPU."""
     import onnxruntime as ort
@@ -279,13 +290,16 @@ def benchmark_onnx_holdout(
     from src.dataset import LiverSegDataset
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    in_channels = 2 * max(0, context_slices) + 1
+    in_channels = total_in_channels(context_slices, dual_window)
     ds = LiverSegDataset(
         holdout_root,
         rows,
         augment=False,
         seed=0,
         context_slices=context_slices,
+        dual_window=dual_window,
+        bone_window_center=bone_window_center,
+        bone_window_width=bone_window_width,
     )
 
     by_patient: dict[str, list[int]] = defaultdict(list)
@@ -329,6 +343,7 @@ def benchmark_onnx_holdout(
         "onnx_size_human": human_bytes(onnx_path.stat().st_size),
         "in_channels": in_channels,
         "context_slices": context_slices,
+        "dual_window": dual_window,
         "n_cases": len(values),
         "n_slices": len(slice_times_ms),
         "avg_case_seconds": float(np.mean(values)) if values else float("nan"),
@@ -493,6 +508,9 @@ def make_loaders(
     seed: int,
     context_slices: int = 0,
     strong_aug: bool = False,
+    dual_window: bool = False,
+    bone_window_center: float = 400.0,
+    bone_window_width: float = 1500.0,
 ) -> tuple[DataLoader, DataLoader, LiverSegDataset, LiverSegDataset]:
     train_ds = LiverSegDataset(
         data_root,
@@ -501,6 +519,9 @@ def make_loaders(
         seed=seed,
         context_slices=context_slices,
         strong_aug=strong_aug,
+        dual_window=dual_window,
+        bone_window_center=bone_window_center,
+        bone_window_width=bone_window_width,
     )
     val_ds = LiverSegDataset(
         data_root,
@@ -509,6 +530,9 @@ def make_loaders(
         seed=seed,
         context_slices=context_slices,
         strong_aug=False,
+        dual_window=dual_window,
+        bone_window_center=bone_window_center,
+        bone_window_width=bone_window_width,
     )
     train_loader = DataLoader(
         train_ds,
@@ -545,7 +569,7 @@ def train_one_fold(
     fold_tag: str = "",
 ) -> dict:
     """Train one split; returns fold result dict including best metrics/paths."""
-    in_channels = 2 * max(0, args.context_slices) + 1
+    in_channels = total_in_channels(args.context_slices, bool(args.dual_window))
     loss_fn = make_loss_fn(args)
     train_loader, val_loader, train_ds, val_ds = make_loaders(
         data_root,
@@ -556,6 +580,9 @@ def train_one_fold(
         seed=args.seed,
         context_slices=args.context_slices,
         strong_aug=bool(getattr(args, "strong_aug", False)),
+        dual_window=bool(args.dual_window),
+        bone_window_center=args.bone_window_center,
+        bone_window_width=args.bone_window_width,
     )
     model = TinyUNet(
         in_channels=in_channels, out_channels=1, base=args.base_channels
@@ -632,6 +659,9 @@ def train_one_fold(
                     "base_channels": args.base_channels,
                     "in_channels": in_channels,
                     "context_slices": args.context_slices,
+                    "dual_window": bool(args.dual_window),
+                    "bone_window_center": args.bone_window_center,
+                    "bone_window_width": args.bone_window_width,
                     "val_patients": val_patients,
                     "fold": fold_tag or None,
                 },
@@ -652,6 +682,7 @@ def train_one_fold(
                 "base_channels": args.base_channels,
                 "in_channels": in_channels,
                 "context_slices": args.context_slices,
+                "dual_window": bool(args.dual_window),
             },
             last_path,
         )
@@ -711,8 +742,16 @@ def export_and_benchmark(
     holdout_rows: list[dict],
     context_slices: int = 0,
     in_channels: int = 1,
+    dual_window: bool = False,
+    bone_window_center: float = 400.0,
+    bone_window_width: float = 1500.0,
 ) -> dict | None:
-    suffix = f"_{image_size}" if context_slices <= 0 else f"_{image_size}_2p5d"
+    parts = [str(image_size)]
+    if context_slices > 0:
+        parts.append("2p5d")
+    if dual_window:
+        parts.append("dual")
+    suffix = "_" + "_".join(parts)
     onnx_path = output / f"liver_unet{suffix}.onnx"
     quant_path = output / f"liver_unet{suffix}.quant.onnx"
     cmd = [
@@ -750,6 +789,9 @@ def export_and_benchmark(
         holdout_rows,
         image_size,
         context_slices=context_slices,
+        dual_window=dual_window,
+        bone_window_center=bone_window_center,
+        bone_window_width=bone_window_width,
     )
     inference_info["float_onnx_path"] = str(onnx_path)
     inference_info["float_onnx_size_bytes"] = onnx_path.stat().st_size if onnx_path.exists() else None
@@ -1015,6 +1057,9 @@ def main() -> int:
             augment=False,
             seed=args.seed,
             context_slices=args.context_slices,
+            dual_window=bool(args.dual_window),
+            bone_window_center=args.bone_window_center,
+            bone_window_width=args.bone_window_width,
         )
         holdout_loader = DataLoader(
             holdout_ds,
@@ -1040,7 +1085,7 @@ def main() -> int:
         metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     inference_info = None
-    in_channels = 2 * max(0, args.context_slices) + 1
+    in_channels = total_in_channels(args.context_slices, bool(args.dual_window))
     if args.export_onnx and best_path.exists():
         inference_info = export_and_benchmark(
             best_path=best_path,
@@ -1051,6 +1096,9 @@ def main() -> int:
             holdout_rows=holdout_rows,
             context_slices=args.context_slices,
             in_channels=in_channels,
+            dual_window=bool(args.dual_window),
+            bone_window_center=args.bone_window_center,
+            bone_window_width=args.bone_window_width,
         )
         if inference_info is not None:
             metrics["inference"] = inference_info
@@ -1087,6 +1135,9 @@ def main() -> int:
         "val_patients": val_patients,
         "base_channels": args.base_channels,
         "context_slices": args.context_slices,
+        "dual_window": bool(args.dual_window),
+        "bone_window_center": args.bone_window_center if args.dual_window else None,
+        "bone_window_width": args.bone_window_width if args.dual_window else None,
         "in_channels": in_channels,
         "image_size": image_size,
         "patience": args.patience,
@@ -1136,6 +1187,12 @@ def main() -> int:
             "Strong CT-aware augs enabled (affine/elastic, HU window jitter, noise, blur)."
             if args.strong_aug
             else "Standard flip/rot/brightness augs."
+        ),
+        (
+            f"Dual HU windows: abdomen C40/W400 + bone C{args.bone_window_center:g}/W{args.bone_window_width:g} "
+            f"→ {in_channels}ch (bone via approx HU invert of abdomen PNG; no Orthanc render)."
+            if args.dual_window
+            else "Single abdomen HU window (C40/W400)."
         ),
         "Fixed holdout under data/holdout excluded from train/val.",
         f"Early stop on val_loss with patience={args.patience}, min_delta={args.min_delta}.",
