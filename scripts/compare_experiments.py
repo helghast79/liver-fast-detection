@@ -47,6 +47,13 @@ RUN_META = [
         "in_channels": 1,
     },
     {
+        "run_name": "hu-orthanc-mimic-192",
+        "label": "HU-OrthancMimic-192",
+        "family": "DICOM HU Orthanc-mimic VOI",
+        "input": "HU + DICOM WC/WW @192 (no /rendered)",
+        "in_channels": 1,
+    },
+    {
         "run_name": "hu-window-192-threshold-lcc",
         "label": "HU-192+LCC",
         "family": "postprocess",
