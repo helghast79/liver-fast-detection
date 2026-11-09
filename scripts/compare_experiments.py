@@ -476,10 +476,54 @@ def plot_dice_vs_run(rows: list[dict], out_path: Path) -> None:
     plt.close(fig)
 
 
+def _wrap_two_lines(text: str, max_chars: int) -> str:
+    """Wrap to at most 2 lines near max_chars (prefer space, then hyphen)."""
+    text = str(text or "").strip()
+    if len(text) <= max_chars:
+        return text
+
+    def _best_break(seps: tuple[str, ...], lo: int, hi: int) -> int | None:
+        best = None
+        # Search a bit past max_chars so names like HU-OrthancMimic-192 can
+        # break on the trailing hyphen instead of mid-token.
+        region = text[: min(len(text), hi)]
+        for sep in seps:
+            idx = region.rfind(sep)
+            while idx >= 0:
+                # Keep hyphen with the first line; drop space/comma from line1.
+                at = idx + 1 if sep == "-" else idx
+                if lo <= at <= hi:
+                    best = at if best is None else max(best, at)
+                    break
+                idx = region.rfind(sep, 0, idx)
+        return best
+
+    lo = max(6, max_chars // 3)
+    hi = max_chars + 8
+    # Prefer whitespace/comma; keep '/' attached to tokens (e.g. /rendered, Tversky/boundary).
+    break_at = _best_break((" ", ","), lo, hi)
+    if break_at is None:
+        break_at = _best_break(("-", "+"), lo, hi)
+    if break_at is None:
+        break_at = max_chars
+
+    line1 = text[:break_at].rstrip(" ,")
+    line2 = text[break_at:].lstrip(" ,")
+    if len(line2) > max_chars + 8:
+        # Only 2 lines allowed — trim remainder with ellipsis.
+        trim_at = max_chars + 6
+        cut = line2[:trim_at].rfind(" ")
+        if cut >= max(6, trim_at // 3):
+            line2 = line2[:cut].rstrip(" ,") + "…"
+        else:
+            line2 = line2[:trim_at].rstrip(" ,") + "…"
+    return f"{line1}\n{line2}"
+
+
 def plot_table(rows: list[dict], out_path: Path) -> None:
     cols = [
-        ("Run", lambda r: r["label"]),
-        ("Input", lambda r: r["input"]),
+        ("Run", lambda r: _wrap_two_lines(r["label"], 16)),
+        ("Input", lambda r: _wrap_two_lines(r["input"], 34)),
         ("Soft Dice", lambda r: _fmt(r["holdout_soft_dice"])),
         ("Hard Dice", lambda r: _fmt(r["holdout_hard_dice"])),
         ("P", lambda r: _fmt(r["holdout_precision"])),
@@ -498,8 +542,9 @@ def plot_table(rows: list[dict], out_path: Path) -> None:
     best_soft_i = int(np.argmax(soft_vals))
     best_hard_i = int(np.argmax(hard_vals))
 
-    fig_h = 1.2 + 0.45 * len(rows)
-    fig, ax = plt.subplots(figsize=(16, fig_h))
+    # Extra height so wrapped Run/Input cells stay readable.
+    fig_h = 1.5 + 0.68 * len(rows)
+    fig, ax = plt.subplots(figsize=(18.5, fig_h))
     ax.axis("off")
     table = ax.table(
         cellText=cell_text,
@@ -508,12 +553,15 @@ def plot_table(rows: list[dict], out_path: Path) -> None:
         cellLoc="center",
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1.0, 1.35)
+    table.set_fontsize(8.5)
+    table.scale(1.0, 2.05)
+    # Widen text columns; keep numeric columns tighter.
+    col_widths = [0.145, 0.30, 0.075, 0.075, 0.05, 0.05, 0.055, 0.065, 0.065, 0.065]
     for (row_i, col_i), cell in table.get_celld().items():
+        cell.set_width(col_widths[col_i])
         if row_i == 0:
             cell.set_facecolor("#1d3557")
-            cell.set_text_props(color="white", weight="bold")
+            cell.set_text_props(color="white", weight="bold", ha="center", va="center")
         else:
             cell.set_facecolor("#f8f9fa" if row_i % 2 else "white")
             # soft dice col index 2, hard dice col index 3 (0-based data cols)
@@ -522,8 +570,14 @@ def plot_table(rows: list[dict], out_path: Path) -> None:
                 cell.set_facecolor("#d8f3dc")
             if col_i == 3 and data_row == best_hard_i:
                 cell.set_facecolor("#d8f3dc")
-    ax.set_title("Main metrics — liver fast-detect holdout comparison", pad=12, fontsize=13)
-    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+            # Left-align wrapped text columns for readability.
+            if col_i in (0, 1):
+                cell.set_text_props(ha="left", va="center", multialignment="left")
+                cell.PAD = 0.03
+            else:
+                cell.set_text_props(ha="center", va="center")
+    ax.set_title("Main metrics — liver fast-detect holdout comparison", pad=14, fontsize=13)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
