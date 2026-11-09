@@ -13,3 +13,4 @@ outputs/
 *.pt
 *.pth
 .DS_Store
+logs/
