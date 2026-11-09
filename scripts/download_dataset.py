@@ -63,13 +63,23 @@ def parse_args() -> argparse.Namespace:
         "--window-center",
         type=float,
         default=40.0,
-        help="Abdomen window center in HU (used with --source hu)",
+        help="Fallback/fixed abdomen window center in HU (used with --source hu)",
     )
     parser.add_argument(
         "--window-width",
         type=float,
         default=400.0,
-        help="Abdomen window width in HU (used with --source hu)",
+        help="Fallback/fixed abdomen window width in HU (used with --source hu)",
+    )
+    parser.add_argument(
+        "--window-mode",
+        choices=("fixed", "dicom"),
+        default="fixed",
+        help=(
+            "With --source hu: 'fixed' uses --window-center/width; "
+            "'dicom' uses each instance WindowCenter/WindowWidth "
+            "(Orthanc /rendered VOI mimic), falling back to fixed if missing"
+        ),
     )
     parser.add_argument("--skip-empty", action="store_true")
     parser.add_argument("--limit-patients", type=int, default=None)
@@ -312,7 +322,8 @@ def main() -> int:
     print(
         f"Image source={args.source} size={image_size}"
         + (
-            f" window=C{window.center}/W{window.width}"
+            f" window_mode={args.window_mode} "
+            f"fallback=C{window.center}/W{window.width}"
             if args.source == "hu"
             else ""
         )
@@ -469,6 +480,7 @@ def main() -> int:
                             dicom_bytes,
                             size=image_size,
                             window=window,
+                            window_mode=args.window_mode,
                         )
                     else:
                         png_bytes = client.download_rendered(
@@ -514,8 +526,17 @@ def main() -> int:
                     "alignment": info["alignment"],
                     "image_size": image_size,
                     "image_source": args.source,
-                    "window_center": window.center if args.source == "hu" else None,
-                    "window_width": window.width if args.source == "hu" else None,
+                    "window_mode": args.window_mode if args.source == "hu" else None,
+                    "window_center": (
+                        (intensity_meta or {}).get("window_center", window.center)
+                        if args.source == "hu"
+                        else None
+                    ),
+                    "window_width": (
+                        (intensity_meta or {}).get("window_width", window.width)
+                        if args.source == "hu"
+                        else None
+                    ),
                     "intensity_meta": intensity_meta or None,
                     "image_path": str(image_path.relative_to(args.output)),
                     "mask_path": str(mask_path.relative_to(args.output)),

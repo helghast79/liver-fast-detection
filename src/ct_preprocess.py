@@ -1,9 +1,17 @@
-"""CT intensity preprocessing: DICOM → HU → fixed abdomen window → uint8."""
+"""CT intensity preprocessing: DICOM → HU → window → uint8.
+
+Supports:
+  - fixed abdomen window (C40/W400)
+  - Orthanc-/rendered mimic: use each instance's DICOM WindowCenter/WindowWidth
+    (VOI LUT), which is what Orthanc REST /instances/{id}/rendered applies by
+    default when no explicit window query param is passed.
+"""
 
 from __future__ import annotations
 
 import io
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pydicom
@@ -30,6 +38,37 @@ class WindowSpec:
         return self.center + self.width / 2.0
 
 
+def _first_float(value: Any) -> float | None:
+    """DICOM WC/WW may be a scalar or MultiValue list."""
+    if value is None:
+        return None
+    if isinstance(value, pydicom.multival.MultiValue):
+        if len(value) == 0:
+            return None
+        return float(value[0])
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def voi_window_from_dicom(
+    ds: Dataset,
+    fallback: WindowSpec | None = None,
+) -> tuple[WindowSpec, str]:
+    """
+    Read WindowCenter/WindowWidth from DICOM (Orthanc /rendered default VOI).
+
+    Returns (window, source) where source is 'dicom' or 'fallback'.
+    """
+    fallback = fallback or WindowSpec()
+    center = _first_float(getattr(ds, "WindowCenter", None))
+    width = _first_float(getattr(ds, "WindowWidth", None))
+    if center is None or width is None or width <= 0:
+        return fallback, "fallback"
+    return WindowSpec(center=center, width=width), "dicom"
+
+
 def dicom_to_hu(ds: Dataset) -> np.ndarray:
     """Convert DICOM pixel data to Hounsfield units (float32)."""
     pixels = np.asarray(ds.pixel_array)
@@ -48,7 +87,7 @@ def dicom_to_hu(ds: Dataset) -> np.ndarray:
 
 
 def apply_window(hu: np.ndarray, window: WindowSpec) -> np.ndarray:
-    """Map HU to float32 in [0, 1] with a fixed window."""
+    """Map HU to float32 in [0, 1] with a fixed window (Orthanc-style linear clip)."""
     clipped = np.clip(hu, window.lo, window.hi)
     return ((clipped - window.lo) / max(window.width, 1e-6)).astype(np.float32)
 
@@ -72,21 +111,33 @@ def dicom_bytes_to_windowed_png(
     dicom_bytes: bytes,
     size: int,
     window: WindowSpec | None = None,
+    window_mode: str = "fixed",
 ) -> tuple[bytes, dict]:
     """
-    Decode DICOM bytes → abdomen-windowed grayscale PNG bytes.
+    Decode DICOM bytes → windowed grayscale PNG bytes.
 
-    Returns (png_bytes, meta) where meta includes window and HU stats.
+    window_mode:
+      - "fixed": use ``window`` (default C40/W400)
+      - "dicom": use instance WindowCenter/WindowWidth (Orthanc /rendered mimic);
+        falls back to ``window`` if tags missing
     """
-    window = window or WindowSpec()
+    fallback = window or WindowSpec()
     ds = pydicom.dcmread(io.BytesIO(dicom_bytes), force=True)
     hu = dicom_to_hu(ds)
-    img = hu_to_uint8_image(hu, size=size, window=window)
+    if window_mode == "dicom":
+        used, win_src = voi_window_from_dicom(ds, fallback=fallback)
+    elif window_mode == "fixed":
+        used, win_src = fallback, "fixed"
+    else:
+        raise ValueError(f"Unknown window_mode={window_mode!r}")
+    img = hu_to_uint8_image(hu, size=size, window=used)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     meta = {
-        "window_center": window.center,
-        "window_width": window.width,
+        "window_center": used.center,
+        "window_width": used.width,
+        "window_mode": window_mode,
+        "window_source": win_src,
         "hu_min": float(np.min(hu)),
         "hu_max": float(np.max(hu)),
         "hu_mean": float(np.mean(hu)),
