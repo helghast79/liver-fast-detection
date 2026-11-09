@@ -10,10 +10,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.bootstrap import sanitize_sys_path
+from src.paths import TASK_LIVER_DETECT, task_outputs
+
+TASK = TASK_LIVER_DETECT
 
 sanitize_sys_path()
 
@@ -29,9 +32,13 @@ from src.model import TinyUNet, bce_dice_loss, soft_dice, soft_iou
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, default=ROOT / "outputs" / "checkpoints" / "best.pt")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=task_outputs(TASK) / "checkpoints" / "best.pt",
+    )
     parser.add_argument("--holdout", type=Path, default=ROOT / "data" / "holdout")
-    parser.add_argument("--output", type=Path, default=ROOT / "outputs")
+    parser.add_argument("--output", type=Path, default=task_outputs(TASK))
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -401,7 +408,7 @@ def main() -> int:
         "n_holdout_slices": len(holdout_rows),
     }
 
-    log_path = args.experiment_log or (ROOT / "outputs" / "experiment_log.md")
+    log_path = args.experiment_log or (task_outputs(TASK) / "experiment_log.md")
     description = args.description or (
         f"Postprocess on `{args.parent_run}`: raise decision threshold and/or "
         "keep largest connected component to cut false positives (no retrain)."

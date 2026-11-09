@@ -1,1 +1,1 @@
-"""Liver fast-detect training package."""
+"""Shared library for fast liver and liver-mass detection tasks."""

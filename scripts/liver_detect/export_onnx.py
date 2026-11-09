@@ -8,10 +8,13 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.bootstrap import sanitize_sys_path
+from src.paths import TASK_LIVER_DETECT, task_outputs
+
+TASK = TASK_LIVER_DETECT
 
 sanitize_sys_path()
 
@@ -24,7 +27,11 @@ from src.model import TinyUNet
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=ROOT / "outputs" / "liver_unet_128.onnx")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=task_outputs(TASK) / "liver_unet_128.onnx",
+    )
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--base-channels", type=int, default=8)
     parser.add_argument(

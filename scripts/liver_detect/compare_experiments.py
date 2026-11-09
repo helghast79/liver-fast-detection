@@ -7,14 +7,20 @@ import argparse
 import csv
 import json
 import re
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from src.paths import TASK_LIVER_DETECT, task_outputs
+
+TASK = TASK_LIVER_DETECT
+DEFAULT_LOG = task_outputs(TASK) / "experiment_log.md"
+DEFAULT_OUT = task_outputs(TASK) / "liver_fast_detect_comparison"
 
 import matplotlib.pyplot as plt
 import numpy as np
-
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LOG = ROOT / "outputs" / "experiment_log.md"
-DEFAULT_OUT = ROOT / "outputs" / "liver_fast_detect_comparison"
 
 # Display order and short labels for charts.
 RUN_META = [
@@ -342,7 +348,7 @@ def write_readme(rows: list[dict], path: Path) -> None:
         "DICOM VOI), postprocess (thr+LCC), patient-wise CV, 2.5D context, capacity bumps, "
         "strong aug + Tversky/boundary, and dual-window (abdomen+bone) inputs.",
         "",
-        f"Source: `outputs/experiment_log.md` ({len(rows)} runs). "
+        f"Source: `outputs/liver_detect/experiment_log.md` ({len(rows)} runs). "
         "Default recipe unless noted: TinyUNet, early-stop patience=15 / min_delta=5e-5.",
         "",
         "| Run | Input | Soft Dice | Hard Dice | P | R | IoU | Case (s) | Quant ONNX |",

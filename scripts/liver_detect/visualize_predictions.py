@@ -2,7 +2,8 @@
 """Browse model predictions on held-out validation patients.
 
 Shows CT, ground-truth mask, prediction, and overlays. Default: web viewer on
-0.0.0.0:8766 using the best checkpoint and val patients from outputs/split.json.
+0.0.0.0:8766 using the best checkpoint and val patients from
+outputs/liver_detect/split.json.
 """
 
 from __future__ import annotations
@@ -18,10 +19,13 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.bootstrap import sanitize_sys_path
+from src.paths import TASK_LIVER_DETECT, task_outputs
+
+TASK = TASK_LIVER_DETECT
 
 sanitize_sys_path()
 
@@ -152,11 +156,11 @@ HTML_PAGE = """<!DOCTYPE html>
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=ROOT / "data" / "raw")
-    parser.add_argument("--split", type=Path, default=ROOT / "outputs" / "split.json")
+    parser.add_argument("--split", type=Path, default=task_outputs(TASK) / "split.json")
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=ROOT / "outputs" / "checkpoints" / "best.pt",
+        default=task_outputs(TASK) / "checkpoints" / "best.pt",
     )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8766)

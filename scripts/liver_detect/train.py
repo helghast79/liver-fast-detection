@@ -13,10 +13,13 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.bootstrap import sanitize_sys_path
+from src.paths import TASK_LIVER_DETECT, task_outputs
+
+TASK = TASK_LIVER_DETECT
 
 sanitize_sys_path()
 
@@ -50,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=ROOT / "data" / "raw")
     parser.add_argument("--holdout", type=Path, default=ROOT / "data" / "holdout")
-    parser.add_argument("--output", type=Path, default=ROOT / "outputs")
+    parser.add_argument("--output", type=Path, default=task_outputs(TASK))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -756,7 +759,7 @@ def export_and_benchmark(
     quant_path = output / f"liver_unet{suffix}.quant.onnx"
     cmd = [
         sys.executable,
-        str(ROOT / "scripts" / "export_onnx.py"),
+        str(ROOT / "scripts" / TASK / "export_onnx.py"),
         "--checkpoint",
         str(best_path),
         "--output",
@@ -850,8 +853,8 @@ def main() -> int:
     args.output.mkdir(parents=True, exist_ok=True)
     ckpt_dir = args.output / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    # Keep the shared experiment log at repo outputs/ even when --output is a run subdir.
-    experiment_log = args.experiment_log or (ROOT / "outputs" / "experiment_log.md")
+    # Keep the shared experiment log at task outputs/ even when --output is a run subdir.
+    experiment_log = args.experiment_log or (task_outputs(TASK) / "experiment_log.md")
     started = datetime.now(timezone.utc)
     run_name = args.run_name or f"baseline-retrain-{started.strftime('%Y%m%d-%H%M%S')}"
     description = args.description or (
