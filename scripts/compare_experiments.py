@@ -14,7 +14,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOG = ROOT / "outputs" / "experiment_log.md"
-DEFAULT_OUT = ROOT / "outputs" / "liver_unet_variable_width_training"
+DEFAULT_OUT = ROOT / "outputs" / "liver_fast_detect_comparison"
 
 # Display order and short labels for charts.
 RUN_META = [
@@ -335,12 +335,15 @@ def write_csv(rows: list[dict], path: Path) -> None:
 
 def write_readme(rows: list[dict], path: Path) -> None:
     lines = [
-        "# Progressive TinyUNet experiment comparison",
+        "# Liver fast-detect model comparison",
         "",
-        "Holdout-fixed comparison across Orthanc render widths, HU windowing, "
-        "postprocess, patient-wise CV (20 val/fold), and 2.5D (prev/center/next).",
+        "Holdout-fixed comparison of all TinyUNet liver segmentation experiments so far: "
+        "Orthanc `/rendered` widths, local HU windowing (fixed C40/W400 and Orthanc-mimic "
+        "DICOM VOI), postprocess (thr+LCC), patient-wise CV, 2.5D context, capacity bumps, "
+        "strong aug + Tversky/boundary, and dual-window (abdomen+bone) inputs.",
         "",
-        "TinyUNet (`base=8`), BCE+Dice, early-stop patience=15 / min_delta=5e-5.",
+        f"Source: `outputs/experiment_log.md` ({len(rows)} runs). "
+        "Default recipe unless noted: TinyUNet, early-stop patience=15 / min_delta=5e-5.",
         "",
         "| Run | Input | Soft Dice | Hard Dice | P | R | IoU | Case (s) | Quant ONNX |",
         "|-----|-------|----------:|----------:|--:|--:|----:|---------:|-----------:|",
@@ -370,8 +373,8 @@ def write_readme(rows: list[dict], path: Path) -> None:
             f"- Best holdout **hard Dice**: `{best_hard['label']}` ({best_hard['holdout_hard_dice']:.3f})",
             "- Holdout patients are fixed (11 after HCC_027 restored; render-128 logged with 10).",
             "- `HU-192+LCC` / `HU-2.5D+LCC` / `HU-b12+LCC` are postprocess only (thr+LCC); same ONNX as parent.",
-            "- All 2.5D ONNX inputs are `[1,3,192,192]` (prev/center/next, edge clamp).",
-            "- Latency: `HU-2.5D-b12` ~1.86s/case (kept); `HU-2.5D-b16` ~3.06s (over ~2s budget).",
+            "- 2.5D ONNX inputs are `[1,3,192,192]`; dual-window is `[1,6,192,192]`; 2D Orthanc-mimic is `[1,1,192,192]`.",
+            "- Latency note: `HU-2.5D-b16` (~3s) exceeds the ~2s/case budget; most 192 2D/2.5D base≤12 stay under it.",
             "",
             "## Artifacts",
             "- `comparison_metrics.csv` — tabular metrics",
@@ -434,7 +437,7 @@ def plot_charts(rows: list[dict], out_path: Path) -> None:
                 fontsize=8,
             )
 
-    fig.suptitle("Liver TinyUNet — progressive holdout comparison", fontsize=13)
+    fig.suptitle("Liver fast-detect — holdout model comparison", fontsize=13)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=140)
     plt.close(fig)
@@ -465,7 +468,7 @@ def plot_dice_vs_run(rows: list[dict], out_path: Path) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=25, ha="right")
     ax.set_ylabel("Dice")
-    ax.set_title("Dice across progressive experiments")
+    ax.set_title("Dice across liver fast-detect experiments")
     ax.set_ylim(0.65, 1.0)
     ax.grid(True, alpha=0.3)
     ax.legend(loc="lower right", fontsize=8)
@@ -519,7 +522,7 @@ def plot_table(rows: list[dict], out_path: Path) -> None:
                 cell.set_facecolor("#d8f3dc")
             if col_i == 3 and data_row == best_hard_i:
                 cell.set_facecolor("#d8f3dc")
-    ax.set_title("Main metrics — progressive holdout comparison", pad=12, fontsize=13)
+    ax.set_title("Main metrics — liver fast-detect holdout comparison", pad=12, fontsize=13)
     fig.savefig(out_path, dpi=140, bbox_inches="tight")
     plt.close(fig)
 
@@ -541,8 +544,12 @@ def main() -> int:
 
     write_csv(rows, args.out / "comparison_metrics.csv")
     summary = {
-        "experiment": "progressive TinyUNet holdout comparison",
-        "model": "TinyUNet base=8, BCE+Dice, patience=15, min_delta=5e-5",
+        "experiment": "liver fast-detect model comparison",
+        "description": (
+            "Holdout-fixed comparison of all TinyUNet liver segmentation runs "
+            "(rendered, HU, Orthanc-mimic VOI, CV, 2.5D, capacity, aug/loss, dual-window)."
+        ),
+        "model": "TinyUNet (base varies by run), early-stop patience=15, min_delta=5e-5",
         "source_log": str(args.log),
         "n_runs": len(rows),
         "runs": rows,
