@@ -24,6 +24,12 @@ class FrameMask:
 
 
 AORTA_LABEL = "abdominal aorta"
+# Series 300 typically has 4 segments; liver-detect merges the first three by name.
+SERIES_300_MERGE_LABELS = ("liver", "mass", "portal vein")
+
+
+def _normalize_segment_label(label: str) -> str:
+    return " ".join(str(label).strip().lower().split())
 
 
 def resolve_segment_numbers(
@@ -37,16 +43,24 @@ def resolve_segment_numbers(
     if not available:
         raise ValueError("SEG has no SegmentSequence entries")
 
-    # Series 300: merge every segment except Abdominal aorta (usually last).
+    # Series 300: merge Liver + Mass + Portal vein (exclude Abdominal aorta).
     if series_number == 300:
+        wanted = set(SERIES_300_MERGE_LABELS)
         chosen = [
             int(s.SegmentNumber)
             for s in segments
-            if AORTA_LABEL not in str(getattr(s, "SegmentLabel", "")).strip().lower()
+            if _normalize_segment_label(getattr(s, "SegmentLabel", "")) in wanted
         ]
         if chosen:
-            return sorted(chosen)
-        # Fallback if labels are missing: drop the highest SegmentNumber.
+            return sorted(set(chosen))
+        # Fallback if labels are missing/renamed: keep non-aorta, drop highest if needed.
+        chosen = [
+            int(s.SegmentNumber)
+            for s in segments
+            if AORTA_LABEL not in _normalize_segment_label(getattr(s, "SegmentLabel", ""))
+        ]
+        if chosen:
+            return sorted(set(chosen))
         numbers = sorted(available)
         return numbers[:-1] if len(numbers) > 1 else numbers
 

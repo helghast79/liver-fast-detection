@@ -54,16 +54,16 @@ def liver_segments_for_series(series_number: int, series_description: str) -> tu
     """
     Return (segment_numbers_to_merge, reason).
 
-    - Series 300: merge all segments except 'Abdominal aorta' (resolved from SEG tags)
+    - Series 300: merge 'Liver' + 'Mass' + 'Portal vein' (resolved from SEG labels)
     - Series 999 'Seg of Spleen, Liver': segment 2 (Liver)
     - Series 999 'Seg of Liver': segment 1 (Liver)
     """
     description = series_description.strip()
     if series_number == 300:
-        # Empty preferred list => resolve_segment_numbers selects all non-aorta segments.
+        # Empty preferred list => resolve_segment_numbers selects by SegmentLabel.
         return (
             [],
-            "SEG SeriesNumber 300; liver = merge all segments except 'Abdominal aorta'",
+            "SEG SeriesNumber 300; liver = merge segment labels Liver + Mass + Portal vein",
         )
     if series_number == 999 and description == SEG_DESC_999_SPLEEN_LIVER:
         return (
@@ -148,10 +148,14 @@ def select_seg_for_patient_id(
     client: OrthancClient,
     patient_id: str,
     orthanc_patient_ids: list[str],
+    *,
+    require_series_number: int | None = None,
 ) -> SegChoice | None:
     """
     Among Orthanc patient resources sharing the same PatientID string,
     prefer a study with SEG series 300; else an accepted SEG 999.
+
+    If ``require_series_number`` is set (e.g. 300), only that SEG series is accepted.
     """
     best_300: SegChoice | None = None
     best_999: SegChoice | None = None
@@ -179,6 +183,12 @@ def select_seg_for_patient_id(
                     series_number=999,
                 )
 
+    if require_series_number == 300:
+        return best_300
+    if require_series_number == 999:
+        return best_999
+    if require_series_number is not None:
+        raise ValueError(f"Unsupported require_series_number={require_series_number!r}")
     return best_300 or best_999
 
 
@@ -222,11 +232,24 @@ def discover_hcc_patients(client: OrthancClient) -> dict[str, list[str]]:
     return grouped
 
 
-def select_all_patients(client: OrthancClient) -> list[SegChoice]:
+def select_all_patients(
+    client: OrthancClient,
+    *,
+    require_series_number: int | None = None,
+    exclude_patient_ids: set[str] | frozenset[str] | None = None,
+) -> list[SegChoice]:
     grouped = discover_hcc_patients(client)
+    excluded = {str(pid) for pid in (exclude_patient_ids or set())}
     choices: list[SegChoice] = []
     for patient_id, orthanc_ids in sorted(grouped.items()):
-        choice = select_seg_for_patient_id(client, patient_id, orthanc_ids)
+        if patient_id in excluded:
+            continue
+        choice = select_seg_for_patient_id(
+            client,
+            patient_id,
+            orthanc_ids,
+            require_series_number=require_series_number,
+        )
         if choice is not None:
             choices.append(choice)
     return choices

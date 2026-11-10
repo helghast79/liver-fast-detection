@@ -104,6 +104,31 @@ def filter_existing_pairs(data_root: Path, rows: list[dict]) -> list[dict]:
     return kept
 
 
+def filter_nonempty_masks(rows: list[dict], data_root: Path | None = None) -> list[dict]:
+    """Keep only slices with a non-empty SEG mask.
+
+    Prefers ``mask_foreground_pixels`` from the manifest; if missing/zero-looking,
+    optionally inspects the PNG on disk when ``data_root`` is provided.
+    """
+    kept: list[dict] = []
+    for row in rows:
+        fg = row.get("mask_foreground_pixels")
+        if fg is not None:
+            if int(fg) > 0:
+                kept.append(row)
+            continue
+        if data_root is None:
+            kept.append(row)
+            continue
+        mask_path = data_root / row["mask_path"]
+        if not mask_path.is_file():
+            continue
+        mask = np.asarray(Image.open(mask_path).convert("L"))
+        if mask.max() > 0:
+            kept.append(row)
+    return kept
+
+
 def series_key(row: dict) -> tuple:
     """Group key for axial ordering within one CT acquisition stack."""
     refs = row.get("referenced_series_uids") or []

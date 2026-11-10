@@ -33,6 +33,7 @@ from tqdm import tqdm
 from src.dataset import (
     LiverSegDataset,
     filter_existing_pairs,
+    filter_nonempty_masks,
     load_manifest,
     patient_kfold_splits,
     patient_split,
@@ -873,7 +874,10 @@ def main() -> int:
             f"(bind {args.dashboard_host})"
         )
 
-    rows = filter_existing_pairs(args.data, load_manifest(args.data))
+    rows = filter_nonempty_masks(
+        filter_existing_pairs(args.data, load_manifest(args.data)),
+        args.data,
+    )
     if not rows:
         print(f"No usable pairs under {args.data}")
         return 1
@@ -881,7 +885,10 @@ def main() -> int:
     holdout_rows: list[dict] = []
     holdout_patients: list[str] = []
     if args.holdout.exists() and (args.holdout / "manifest.jsonl").exists():
-        holdout_rows = filter_existing_pairs(args.holdout, load_manifest(args.holdout))
+        holdout_rows = filter_nonempty_masks(
+            filter_existing_pairs(args.holdout, load_manifest(args.holdout)),
+            args.holdout,
+        )
         holdout_patients = sorted({r["patient_id"] for r in holdout_rows})
 
     if not torch.cuda.is_available():

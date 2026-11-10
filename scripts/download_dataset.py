@@ -85,6 +85,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-patients", type=int, default=None)
     parser.add_argument("--patient-id", type=str, default=None)
     parser.add_argument(
+        "--require-series-number",
+        type=int,
+        default=None,
+        choices=(300, 999),
+        help="Only accept patients that have this SEG SeriesNumber (no fallback)",
+    )
+    parser.add_argument(
+        "--exclude-patient-id",
+        action="append",
+        default=[],
+        help="PatientID to exclude (repeatable), e.g. HCC_005",
+    )
+    parser.add_argument(
         "--ipp-decimals",
         type=int,
         default=3,
@@ -311,13 +324,24 @@ def main() -> int:
 
     client = OrthancClient()
     print(f"Connecting to {client.base_url} ...")
-    choices = select_all_patients(client)
+    exclude_ids = {str(pid) for pid in (args.exclude_patient_id or [])}
+    choices = select_all_patients(
+        client,
+        require_series_number=args.require_series_number,
+        exclude_patient_ids=exclude_ids,
+    )
     if args.patient_id:
         choices = [c for c in choices if c.patient_id == args.patient_id]
     if args.limit_patients is not None:
         choices = choices[: args.limit_patients]
 
-    print(f"Selected {len(choices)} patient(s) with usable SEG series")
+    req = (
+        f" require_series={args.require_series_number}"
+        if args.require_series_number is not None
+        else ""
+    )
+    excl = f" excluded={sorted(exclude_ids)}" if exclude_ids else ""
+    print(f"Selected {len(choices)} patient(s) with usable SEG series{req}{excl}")
     window = WindowSpec(center=args.window_center, width=args.window_width)
     print(
         f"Image source={args.source} size={image_size}"
