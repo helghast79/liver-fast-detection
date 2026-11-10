@@ -41,6 +41,8 @@ from src.geometry import (
 )
 from src.orthanc_client import OrthancClient
 from src.seg_masks import (
+    MASK_TARGET_LIVER,
+    MASK_TARGET_MASS,
     extract_liver_frames,
     referenced_series_uids,
     resize_mask,
@@ -96,6 +98,16 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="PatientID to exclude (repeatable), e.g. HCC_005",
+    )
+    parser.add_argument(
+        "--mask-target",
+        choices=(MASK_TARGET_LIVER, MASK_TARGET_MASS),
+        default=MASK_TARGET_LIVER,
+        help=(
+            "Which SEG labels to keep for series 300: "
+            "'liver' merges Liver+Mass+Portal vein; "
+            "'mass' keeps only Mass (normally segment 2)"
+        ),
     )
     parser.add_argument(
         "--ipp-decimals",
@@ -329,6 +341,7 @@ def main() -> int:
         client,
         require_series_number=args.require_series_number,
         exclude_patient_ids=exclude_ids,
+        mask_target=args.mask_target,
     )
     if args.patient_id:
         choices = [c for c in choices if c.patient_id == args.patient_id]
@@ -341,7 +354,10 @@ def main() -> int:
         else ""
     )
     excl = f" excluded={sorted(exclude_ids)}" if exclude_ids else ""
-    print(f"Selected {len(choices)} patient(s) with usable SEG series{req}{excl}")
+    print(
+        f"Selected {len(choices)} patient(s) with usable SEG series"
+        f"{req}{excl} mask_target={args.mask_target}"
+    )
     window = WindowSpec(center=args.window_center, width=args.window_width)
     print(
         f"Image source={args.source} size={image_size}"
@@ -386,6 +402,7 @@ def main() -> int:
                         liver_segment_numbers=choice.liver_segment_numbers,
                         series_number=choice.series_number,
                         series_description=choice.series_description,
+                        mask_target=args.mask_target,
                     )
                     if frames:
                         used_segments = frames[0].segment_numbers

@@ -26,6 +26,9 @@ class FrameMask:
 AORTA_LABEL = "abdominal aorta"
 # Series 300 typically has 4 segments; liver-detect merges the first three by name.
 SERIES_300_MERGE_LABELS = ("liver", "mass", "portal vein")
+SERIES_300_MASS_LABELS = ("mass",)
+MASK_TARGET_LIVER = "liver"
+MASK_TARGET_MASS = "mass"
 
 
 def _normalize_segment_label(label: str) -> str:
@@ -37,14 +40,30 @@ def resolve_segment_numbers(
     preferred: list[int],
     series_number: int,
     series_description: str = "",
+    mask_target: str = MASK_TARGET_LIVER,
 ) -> list[int]:
     segments = list(getattr(seg_ds, "SegmentSequence", []) or [])
     available = {int(getattr(s, "SegmentNumber", 0)) for s in segments}
     if not available:
         raise ValueError("SEG has no SegmentSequence entries")
 
-    # Series 300: merge Liver + Mass + Portal vein (exclude Abdominal aorta).
+    # Series 300: either Mass-only or Liver+Mass+Portal vein (exclude Abdominal aorta).
     if series_number == 300:
+        if mask_target == MASK_TARGET_MASS:
+            wanted = set(SERIES_300_MASS_LABELS)
+            chosen = [
+                int(s.SegmentNumber)
+                for s in segments
+                if _normalize_segment_label(getattr(s, "SegmentLabel", "")) in wanted
+            ]
+            if chosen:
+                return sorted(set(chosen))
+            # Fallback: Mass is normally SegmentNumber 2.
+            if 2 in available:
+                return [2]
+            numbers = sorted(available)
+            return [numbers[1]] if len(numbers) >= 2 else numbers
+
         wanted = set(SERIES_300_MERGE_LABELS)
         chosen = [
             int(s.SegmentNumber)
@@ -157,6 +176,7 @@ def extract_liver_frames(
     liver_segment_numbers: list[int],
     series_number: int,
     series_description: str = "",
+    mask_target: str = MASK_TARGET_LIVER,
 ) -> tuple[list[FrameMask], Dataset]:
     """
     Extract per-plane masks, OR-merging requested segments.
@@ -170,6 +190,7 @@ def extract_liver_frames(
         preferred=liver_segment_numbers,
         series_number=series_number,
         series_description=series_description,
+        mask_target=mask_target,
     )
     series_uid = _series_uid_from_shared(seg_ds)
 

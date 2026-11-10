@@ -39,6 +39,18 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Drop these PatientIDs entirely before splitting (repeatable)",
     )
+    parser.add_argument(
+        "--holdout-patient-id",
+        action="append",
+        default=[],
+        help="Explicit holdout PatientID (repeatable). Overrides --n-holdout/--seed shuffle.",
+    )
+    parser.add_argument(
+        "--holdout-from-json",
+        type=Path,
+        default=None,
+        help="JSON with holdout_patients list (e.g. prior split_holdout.json)",
+    )
     return parser.parse_args()
 
 
@@ -73,12 +85,29 @@ def main() -> int:
         print(f"Need at least 2 patients to split; found {len(patients)}")
         return 1
 
-    n_hold = min(max(1, args.n_holdout), len(patients) - 1)
-    rng = random.Random(args.seed)
-    shuffled = patients[:]
-    rng.shuffle(shuffled)
-    holdout_patients = sorted(shuffled[:n_hold])
-    hold_set = set(holdout_patients)
+    fixed_holdout: list[str] = []
+    if args.holdout_from_json is not None:
+        payload = json.loads(args.holdout_from_json.read_text(encoding="utf-8"))
+        fixed_holdout.extend(str(p) for p in (payload.get("holdout_patients") or []))
+    fixed_holdout.extend(str(p) for p in (args.holdout_patient_id or []))
+
+    if fixed_holdout:
+        hold_set = set(fixed_holdout)
+        missing = sorted(hold_set - set(patients))
+        if missing:
+            print(f"WARNING: holdout patients missing from src: {missing}")
+        holdout_patients = sorted(p for p in patients if p in hold_set)
+        if not holdout_patients:
+            print("No requested holdout patients present in src")
+            return 1
+        n_hold = len(holdout_patients)
+    else:
+        n_hold = min(max(1, args.n_holdout), len(patients) - 1)
+        rng = random.Random(args.seed)
+        shuffled = patients[:]
+        rng.shuffle(shuffled)
+        holdout_patients = sorted(shuffled[:n_hold])
+        hold_set = set(holdout_patients)
     raw_patients = sorted(p for p in patients if p not in hold_set)
 
     if args.raw.exists() or args.holdout.exists():

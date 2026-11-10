@@ -50,17 +50,27 @@ def _is_seg_series(series: dict[str, Any]) -> bool:
     return modality == "SEG"
 
 
-def liver_segments_for_series(series_number: int, series_description: str) -> tuple[list[int], str]:
+def liver_segments_for_series(
+    series_number: int,
+    series_description: str,
+    mask_target: str = "liver",
+) -> tuple[list[int], str]:
     """
     Return (segment_numbers_to_merge, reason).
 
-    - Series 300: merge 'Liver' + 'Mass' + 'Portal vein' (resolved from SEG labels)
+    - Series 300 + liver: merge 'Liver' + 'Mass' + 'Portal vein'
+    - Series 300 + mass: keep only 'Mass' (normally SegmentNumber 2)
     - Series 999 'Seg of Spleen, Liver': segment 2 (Liver)
     - Series 999 'Seg of Liver': segment 1 (Liver)
     """
     description = series_description.strip()
     if series_number == 300:
         # Empty preferred list => resolve_segment_numbers selects by SegmentLabel.
+        if mask_target == "mass":
+            return (
+                [],
+                "SEG SeriesNumber 300; mass = segment label Mass (fallback SegmentNumber 2)",
+            )
         return (
             [],
             "SEG SeriesNumber 300; liver = merge segment labels Liver + Mass + Portal vein",
@@ -125,10 +135,13 @@ def _choice_from_series(
     study: dict[str, Any],
     series: dict[str, Any],
     series_number: int,
+    mask_target: str = "liver",
 ) -> SegChoice:
     tags = _main_tags(series)
     description = str(tags.get("SeriesDescription", "")).strip()
-    segment_numbers, reason = liver_segments_for_series(series_number, description)
+    segment_numbers, reason = liver_segments_for_series(
+        series_number, description, mask_target=mask_target
+    )
     study_tags = _main_tags(study)
     return SegChoice(
         patient_id=patient_id,
@@ -150,6 +163,7 @@ def select_seg_for_patient_id(
     orthanc_patient_ids: list[str],
     *,
     require_series_number: int | None = None,
+    mask_target: str = "liver",
 ) -> SegChoice | None:
     """
     Among Orthanc patient resources sharing the same PatientID string,
@@ -172,6 +186,7 @@ def select_seg_for_patient_id(
                     study=study,
                     series=seg_300,
                     series_number=300,
+                    mask_target=mask_target,
                 )
 
             if seg_999 is not None and best_999 is None:
@@ -181,6 +196,7 @@ def select_seg_for_patient_id(
                     study=study,
                     series=seg_999,
                     series_number=999,
+                    mask_target=mask_target,
                 )
 
     if require_series_number == 300:
@@ -237,6 +253,7 @@ def select_all_patients(
     *,
     require_series_number: int | None = None,
     exclude_patient_ids: set[str] | frozenset[str] | None = None,
+    mask_target: str = "liver",
 ) -> list[SegChoice]:
     grouped = discover_hcc_patients(client)
     excluded = {str(pid) for pid in (exclude_patient_ids or set())}
@@ -249,6 +266,7 @@ def select_all_patients(
             patient_id,
             orthanc_ids,
             require_series_number=require_series_number,
+            mask_target=mask_target,
         )
         if choice is not None:
             choices.append(choice)
