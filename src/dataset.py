@@ -99,8 +99,15 @@ def filter_existing_pairs(data_root: Path, rows: list[dict]) -> list[dict]:
     for row in rows:
         image_path = data_root / row["image_path"]
         mask_path = data_root / row["mask_path"]
-        if image_path.is_file() and mask_path.is_file():
-            kept.append(row)
+        if not (image_path.is_file() and mask_path.is_file()):
+            continue
+        path_b = row.get("image_path_b")
+        if path_b and not (data_root / path_b).is_file():
+            continue
+        liver_path = row.get("liver_mask_path")
+        if liver_path and not (data_root / liver_path).is_file():
+            continue
+        kept.append(row)
     return kept
 
 
@@ -189,9 +196,26 @@ def spatial_channels(context_slices: int = 0) -> int:
     return 2 * max(0, int(context_slices)) + 1
 
 
-def total_in_channels(context_slices: int = 0, dual_window: bool = False) -> int:
-    n = spatial_channels(context_slices)
+def total_in_channels(
+    context_slices: int = 0,
+    dual_window: bool = False,
+    dual_series: bool = False,
+    liver_prior: bool = False,
+) -> int:
+    if dual_series or liver_prior:
+        # Dual CT series OR CT + liver-prior bool occupy 2 spatial channels.
+        n = 2
+    else:
+        n = spatial_channels(context_slices)
     return n * 2 if dual_window else n
+
+
+def rows_have_dual_series(rows: list[dict]) -> bool:
+    return any(bool(r.get("image_path_b")) and not r.get("liver_prior") for r in rows)
+
+
+def rows_have_liver_prior(rows: list[dict]) -> bool:
+    return any(bool(r.get("liver_mask_path")) or bool(r.get("liver_prior")) for r in rows)
 
 
 class LiverSegDataset(Dataset):
@@ -208,12 +232,18 @@ class LiverSegDataset(Dataset):
         dual_window: bool = False,
         bone_window_center: float = 400.0,
         bone_window_width: float = 1500.0,
+        dual_series: bool | None = None,
+        liver_prior: bool | None = None,
     ) -> None:
         """
         context_slices=0 -> 1-channel center only.
         context_slices=1 -> 3-channel stack [prev, center, next] with edge clamp.
         dual_window appends a second HU window (bone/soft) per spatial slice:
           [abd_prev..abd_next, bone_prev..bone_next] (or 2ch if context=0).
+        dual_series stacks image_path + image_path_b as 2 spatial channels
+        (requires context_slices=0); secondary is already resampled onto primary.
+        liver_prior stacks [CT, liver_bool] from image_path + liver_mask_path
+        (requires context_slices=0). Prefer this over dual_series when both set.
         Bone channels are derived by approx-inverting the stored abdomen PNG
         (assumed C40/W400) then re-windowing — no Orthanc /rendered.
         strong_aug adds CT-aware augs: small affine/elastic, HU window jitter,
@@ -224,10 +254,29 @@ class LiverSegDataset(Dataset):
         self.augment = augment
         self.strong_aug = bool(strong_aug)
         self.dual_window = bool(dual_window)
+        self.liver_prior = (
+            rows_have_liver_prior(rows) if liver_prior is None else bool(liver_prior)
+        )
+        self.dual_series = (
+            False
+            if self.liver_prior
+            else (rows_have_dual_series(rows) if dual_series is None else bool(dual_series))
+        )
+        if (self.dual_series or self.liver_prior) and int(context_slices) > 0:
+            raise ValueError("dual_series/liver_prior currently require context_slices=0")
         self.rng = random.Random(seed)
-        self.context_slices = max(0, int(context_slices))
-        self.n_spatial = spatial_channels(self.context_slices)
-        self.in_channels = total_in_channels(self.context_slices, self.dual_window)
+        self.context_slices = (
+            0 if (self.dual_series or self.liver_prior) else max(0, int(context_slices))
+        )
+        self.n_spatial = (
+            2 if (self.dual_series or self.liver_prior) else spatial_channels(self.context_slices)
+        )
+        self.in_channels = total_in_channels(
+            self.context_slices,
+            self.dual_window,
+            dual_series=self.dual_series,
+            liver_prior=self.liver_prior,
+        )
         self.neighbor_index = build_neighbor_index(rows, context=self.context_slices)
         self.base_window_center = float(base_window_center)
         self.base_window_width = float(base_window_width)
@@ -341,12 +390,33 @@ class LiverSegDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         row = self.rows[idx]
-        neighbor_idxs = self.neighbor_index[idx]
-        abd_channels = [
-            self._load_gray(self.rows[j]["image_path"]) / 255.0 for j in neighbor_idxs
-        ]
-        # (n_spatial, H, W) abdomen, then optional bone append
-        abd = np.stack(abd_channels, axis=0).astype(np.float32)
+        if self.liver_prior:
+            liver_rel = row.get("liver_mask_path")
+            if not liver_rel:
+                raise KeyError(
+                    f"liver_prior row missing liver_mask_path: {row.get('sop_instance_uid')}"
+                )
+            ct = self._load_gray(row["image_path"]) / 255.0
+            liver = (self._load_gray(liver_rel) > 127).astype(np.float32)
+            abd = np.stack([ct, liver], axis=0).astype(np.float32)
+        elif self.dual_series:
+            path_b = row.get("image_path_b")
+            if not path_b:
+                raise KeyError(f"dual_series row missing image_path_b: {row.get('sop_instance_uid')}")
+            abd = np.stack(
+                [
+                    self._load_gray(row["image_path"]) / 255.0,
+                    self._load_gray(path_b) / 255.0,
+                ],
+                axis=0,
+            ).astype(np.float32)
+        else:
+            neighbor_idxs = self.neighbor_index[idx]
+            abd_channels = [
+                self._load_gray(self.rows[j]["image_path"]) / 255.0 for j in neighbor_idxs
+            ]
+            # (n_spatial, H, W) abdomen, then optional bone append
+            abd = np.stack(abd_channels, axis=0).astype(np.float32)
         image = self._stack_windows(abd)
         mask = (self._load_gray(row["mask_path"]) > 127).astype(np.float32)
 
