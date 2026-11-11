@@ -27,8 +27,10 @@ AORTA_LABEL = "abdominal aorta"
 # Series 300 typically has 4 segments; liver-detect merges the first three by name.
 SERIES_300_MERGE_LABELS = ("liver", "mass", "portal vein")
 SERIES_300_MASS_LABELS = ("mass",)
+SERIES_300_LIVER_ONLY_LABELS = ("liver",)
 MASK_TARGET_LIVER = "liver"
 MASK_TARGET_MASS = "mass"
+MASK_TARGET_LIVER_ONLY = "liver_only"
 
 
 def _normalize_segment_label(label: str) -> str:
@@ -47,7 +49,7 @@ def resolve_segment_numbers(
     if not available:
         raise ValueError("SEG has no SegmentSequence entries")
 
-    # Series 300: either Mass-only or Liver+Mass+Portal vein (exclude Abdominal aorta).
+    # Series 300: Mass-only, Liver-only prior, or Liver+Mass+Portal vein merge.
     if series_number == 300:
         if mask_target == MASK_TARGET_MASS:
             wanted = set(SERIES_300_MASS_LABELS)
@@ -63,6 +65,21 @@ def resolve_segment_numbers(
                 return [2]
             numbers = sorted(available)
             return [numbers[1]] if len(numbers) >= 2 else numbers
+
+        if mask_target == MASK_TARGET_LIVER_ONLY:
+            wanted = set(SERIES_300_LIVER_ONLY_LABELS)
+            chosen = [
+                int(s.SegmentNumber)
+                for s in segments
+                if _normalize_segment_label(getattr(s, "SegmentLabel", "")) in wanted
+            ]
+            if chosen:
+                return sorted(set(chosen))
+            # Fallback: Liver is normally SegmentNumber 1.
+            if 1 in available:
+                return [1]
+            numbers = sorted(available)
+            return [numbers[0]]
 
         wanted = set(SERIES_300_MERGE_LABELS)
         chosen = [
