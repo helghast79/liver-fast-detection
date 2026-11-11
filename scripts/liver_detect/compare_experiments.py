@@ -134,6 +134,20 @@ RUN_META = [
         "input": "base12 2.5D 6ch abd+bone + strong aug + Tversky/boundary",
         "in_channels": 6,
     },
+    {
+        "run_name": "hu-window-192-v2",
+        "label": "HU-192-v2",
+        "family": "DICOM HU v2 dataset",
+        "input": "SEG300 Liver∪Mass∪Portal, nonempty @192",
+        "in_channels": 1,
+    },
+    {
+        "run_name": "hu-window-192-v2-2p5d-base16",
+        "label": "HU-v2-2.5D-b16",
+        "family": "DICOM HU v2 + 2.5D capacity",
+        "input": "v2 data, 3ch prev/c/next, base=16 @192",
+        "in_channels": 3,
+    },
 ]
 
 
@@ -346,7 +360,8 @@ def write_readme(rows: list[dict], path: Path) -> None:
         "Holdout-fixed comparison of all TinyUNet liver segmentation experiments so far: "
         "Orthanc `/rendered` widths, local HU windowing (fixed C40/W400 and Orthanc-mimic "
         "DICOM VOI), postprocess (thr+LCC), patient-wise CV, 2.5D context, capacity bumps, "
-        "strong aug + Tversky/boundary, and dual-window (abdomen+bone) inputs.",
+        "strong aug + Tversky/boundary, dual-window (abdomen+bone) inputs, and v2 SEG300 "
+        "organ-merge datasets (1ch and 2.5D base16).",
         "",
         f"Source: `outputs/liver_detect/experiment_log.md` ({len(rows)} runs). "
         "Default recipe unless noted: TinyUNet, early-stop patience=15 / min_delta=5e-5.",
