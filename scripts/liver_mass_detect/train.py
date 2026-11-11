@@ -37,6 +37,8 @@ from src.dataset import (
     load_manifest,
     patient_kfold_splits,
     patient_split,
+    rows_have_dual_series,
+    rows_have_liver_prior,
     total_in_channels,
 )
 from src.model import (
@@ -52,8 +54,10 @@ from src.train_monitor import MetricsStore, start_dashboard
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path, default=ROOT / "data" / "raw_v2_mass")
-    parser.add_argument("--holdout", type=Path, default=ROOT / "data" / "holdout_v2_mass")
+    parser.add_argument("--data", type=Path, default=ROOT / "data" / "raw_v2_mass_liverprior")
+    parser.add_argument(
+        "--holdout", type=Path, default=ROOT / "data" / "holdout_v2_mass_liverprior"
+    )
     parser.add_argument("--output", type=Path, default=task_outputs(TASK))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -300,7 +304,14 @@ def benchmark_onnx_holdout(
     from src.dataset import LiverSegDataset
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    in_channels = total_in_channels(context_slices, dual_window)
+    liver_prior = rows_have_liver_prior(rows)
+    dual_series = (not liver_prior) and rows_have_dual_series(rows)
+    in_channels = total_in_channels(
+        context_slices,
+        dual_window,
+        dual_series=dual_series,
+        liver_prior=liver_prior,
+    )
     ds = LiverSegDataset(
         holdout_root,
         rows,
@@ -310,6 +321,8 @@ def benchmark_onnx_holdout(
         dual_window=dual_window,
         bone_window_center=bone_window_center,
         bone_window_width=bone_window_width,
+        dual_series=dual_series,
+        liver_prior=liver_prior,
     )
 
     by_patient: dict[str, list[int]] = defaultdict(list)
@@ -579,7 +592,16 @@ def train_one_fold(
     fold_tag: str = "",
 ) -> dict:
     """Train one split; returns fold result dict including best metrics/paths."""
-    in_channels = total_in_channels(args.context_slices, bool(args.dual_window))
+    liver_prior = rows_have_liver_prior(train_rows) or rows_have_liver_prior(val_rows)
+    dual_series = (not liver_prior) and (
+        rows_have_dual_series(train_rows) or rows_have_dual_series(val_rows)
+    )
+    in_channels = total_in_channels(
+        args.context_slices,
+        bool(args.dual_window),
+        dual_series=dual_series,
+        liver_prior=liver_prior,
+    )
     loss_fn = make_loss_fn(args)
     train_loader, val_loader, train_ds, val_ds = make_loaders(
         data_root,
@@ -761,6 +783,8 @@ def export_and_benchmark(
         parts.append("2p5d")
     if dual_window:
         parts.append("dual")
+    if in_channels == 2 and not dual_window and context_slices == 0:
+        parts.append("liverprior" if rows_have_liver_prior(holdout_rows) else "2ch")
     suffix = "_" + "_".join(parts)
     onnx_path = output / f"mass_unet{suffix}.onnx"
     quant_path = output / f"mass_unet{suffix}.quant.onnx"
@@ -1116,7 +1140,16 @@ def main() -> int:
         metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     inference_info = None
-    in_channels = total_in_channels(args.context_slices, bool(args.dual_window))
+    liver_prior = rows_have_liver_prior(rows) or rows_have_liver_prior(holdout_rows)
+    dual_series = (not liver_prior) and (
+        rows_have_dual_series(rows) or rows_have_dual_series(holdout_rows)
+    )
+    in_channels = total_in_channels(
+        args.context_slices,
+        bool(args.dual_window),
+        dual_series=dual_series,
+        liver_prior=liver_prior,
+    )
     if args.export_onnx and best_path.exists():
         inference_info = export_and_benchmark(
             best_path=best_path,
